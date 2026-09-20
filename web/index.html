@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>以撒 Mod 管理器 · The Binding of Isaac</title>
+<link rel="stylesheet" href="/web/style.css">
+</head>
+<body>
+
+<!-- ============ 背景层 (视差) ============ -->
+<div class="bg" id="bgWrap">
+  <img class="bg-art" id="bgArt" src="/assets/bg_source.jpg" alt="">
+  <img class="bg-art bg-blur" id="bgBlur" src="/assets/bg_source.jpg" alt="">
+  <div class="orb orb-1"></div>
+  <div class="orb orb-2"></div>
+  <div class="orb orb-3"></div>
+  <canvas id="dust"></canvas>
+  <div class="vignette"></div>
+  <div class="grain"></div>
+</div>
+
+<!-- ============ 侧边栏 ============ -->
+<aside class="sidebar glass" id="sidebar">
+  <div class="brand">
+    <span class="brand-mark">◈</span>
+    <span class="brand-text">以撒 Mod 库</span>
+  </div>
+
+  <nav class="nav" id="nav"></nav>
+
+  <div class="side-foot">
+    <div class="launch-block">
+      <button class="fab" id="fabLaunch" title="启动游戏">
+        <span class="fab-ring"></span>
+        <span class="fab-icon">▶</span>
+      </button>
+      <span class="side-foot-label">启动游戏</span>
+    </div>
+    <div class="foot-right">
+      <button class="gear" id="btnSettings" title="设置">⚙</button>
+      <button class="gear quit" id="btnQuit" title="退出程序 (关闭后台服务)">⏻</button>
+    </div>
+  </div>
+</aside>
+
+<!-- ============ 主区域 ============ -->
+<main class="main">
+
+  <header class="topbar glass">
+    <button class="chip" id="btnLibrary">
+      <span class="chip-icon">▤</span><span>打开 mod 仓库</span>
+    </button>
+    <button class="chip" id="btnSearchWs" title="在应用内搜索 Steam 创意工坊">
+      <span class="chip-icon">⌕</span><span>搜索工坊</span>
+    </button>
+    <button class="chip ws" id="btnWorkshop" title="复制创意工坊链接后点这里，自动识别并添加">
+      <span class="chip-icon">⧉</span><span>工坊链接添加</span>
+    </button>
+    <div class="path" id="pathText" title="点击打开设置">—</div>
+    <div class="topbar-actions">
+      <button class="btn" data-act="refresh"><span>↻</span>刷 新</button>
+      <button class="btn" data-act="import"><span>↓</span>导入实体 mod</button>
+      <button class="btn" id="btnWsList" title="列出 Steam 里已下载的工坊 mod，可一键导入仓库"><span>⇩</span>Steam 已下载</button>
+      <button class="btn" data-act="reset"><span>⊕</span>重置筛选</button>
+    </div>
+  </header>
+
+  <section class="filters">
+    <label class="search">
+      <svg viewBox="0 0 24 24" class="search-icon"><circle cx="10" cy="10" r="6.5"/><line x1="15" y1="15" x2="21" y2="21"/></svg>
+      <input id="search" type="search" placeholder="搜索 mod 名称或文件夹…" spellcheck="false">
+      <button class="search-clear" id="searchClear" title="清空">✕</button>
+    </label>
+
+    <div class="select-wrap"><span class="select-label">状态</span>
+      <select id="filterState">
+        <option value="all">全部</option><option value="enabled">已启用</option>
+        <option value="disabled">已停用</option><option value="unimported">未导入</option>
+      </select>
+    </div>
+
+    <div class="select-wrap"><span class="select-label">排序</span>
+      <select id="sortBy">
+        <option value="name">名称</option><option value="version">版本</option>
+        <option value="dir">文件夹</option><option value="state">状态</option>
+      </select>
+    </div>
+
+    <label class="switch" id="switchShow">
+      <input type="checkbox" id="showDisabled" checked>
+      <span class="switch-track"><span class="switch-thumb"></span></span>
+      <span class="switch-text">显示已停用</span>
+    </label>
+
+    <button class="sync-btn" id="btnSync">
+      <span class="sync-sheen"></span><span>≫ 一键同步到游戏</span>
+    </button>
+  </section>
+
+  <section class="grid-wrap">
+    <div class="grid" id="grid"></div>
+    <div class="empty" id="empty" hidden>
+      <img class="empty-img" src="/assets/empty_state.png" alt="">
+      <p>这里空空如也 ~ 换个筛选条件看看吧</p>
+    </div>
+  </section>
+
+  <footer class="bottombar glass">
+    <div class="stats" id="stats"></div>
+    <div class="bottom-actions">
+      <button class="btn ghost" id="btnClear">取消选择</button>
+      <label class="check"><input type="checkbox" id="checkAll"><span>全选</span></label>
+      <button class="btn green" data-act="batch-enable"><span>✔</span>批量启用</button>
+      <button class="btn red" data-act="batch-disable"><span>✖</span>批量禁用</button>
+      <button class="btn ghost" data-act="more">⋯ 更多</button>
+    </div>
+  </footer>
+
+  <div class="statusline" id="statusline">就绪</div>
+</main>
+
+<!-- ============ 浮层 ============ -->
+<div class="toasts" id="toasts"></div>
+<div class="modal-root" id="modalRoot" hidden>
+  <div class="modal-backdrop" data-close="1"></div>
+  <div class="modal glass" id="modalBox"></div>
+</div>
+<div class="ctxmenu glass" id="ctxmenu" hidden></div>
+
+<!-- ============ Mod 入门 ============ -->
+<div class="gd-root" id="gdPanel" hidden>
+  <div class="wsp-backdrop" data-gd-close="1"></div>
+  <div class="gd-box">
+    <div class="gd-head">
+      <div class="gd-title">Mod 入门 <span class="gd-sub">给刚接触以撒 Mod 的人</span></div>
+      <button class="btn ghost" id="gdClose">关闭</button>
+    </div>
+    <div class="gd-tabs" id="gdTabs">
+      <button class="gd-tab active" data-gd="1">版本区别</button>
+      <button class="gd-tab" data-gd="2">语言设置</button>
+      <button class="gd-tab" data-gd="3">工坊打 Mod</button>
+      <button class="gd-tab" data-gd="4">用本管理器</button>
+    </div>
+
+    <div class="gd-body">
+      <!-- ---------- 一、版本区别 ---------- -->
+      <section class="gd-sec" data-gd="1">
+        <p class="gd-lead">《以撒的结合：重生》的资料片按发行顺序共四部，社区常用缩写称呼。
+          下面每条的"新增内容"都照抄 Steam 商店页对该资料片的官方描述。</p>
+
+        <h5>本体 · Rebirth</h5>
+        <p>2014 年发行，游戏的基础版本（其余资料片都要以它为前提）。</p>
+
+        <h5>AB · Afterbirth</h5>
+        <p class="gd-meta">官方发行日 2015 年 10 月 30 日</p>
+        <ul>
+          <li><b>贪婪模式</b>（Greed Mode）—— 强调风险与回报的全新玩法</li>
+          <li>主线扩展 —— 新的最终区域与新的最终 BOSS</li>
+          <li><b>每日挑战</b>（Daily Runs）与在线排行榜</li>
+          <li>10 个全新挑战</li>
+          <li>1000+ 新房间设计</li>
+          <li>大幅重做的武器组合系统</li>
+          <li>120 个新物品（物品总数超过 500）</li>
+        </ul>
+
+        <h5>AB+ · Afterbirth+</h5>
+        <p class="gd-meta">官方发行日 2017 年 1 月 3 日</p>
+        <ul>
+          <li>55+ 新物品</li>
+          <li>带有新 BOSS 与新结局的新最终章节</li>
+          <li>新可玩角色</li>
+          <li>贪婪困难模式</li>
+          <li>5 个新挑战、新 BOSS</li>
+          <li><b>开发者工具（DEV TOOLS）</b> —— 可以自己设计、编辑、游玩 mod</li>
+          <li>数百个新房间</li>
+        </ul>
+        <div class="gd-note warn"><b>要打 Mod，至少得拥有 AB+</b>：Mod 支持是 AB+ 这一版引入的。</div>
+
+        <h5>忏悔 · Repentance</h5>
+        <p class="gd-meta">官方发行日 2021 年 3 月 31 日</p>
+        <p>Steam 页面的原话是它"<b>收录了 Rebirth、Afterbirth 与 Afterbirth+ 的全部内容</b>"，并额外带来：</p>
+        <ul>
+          <li>130+ 新物品（物品总数 700+）</li>
+          <li>一条完整的替代路线：全新章节 + 新最终 BOSS + 新结局</li>
+          <li>100+ 新敌人</li>
+          <li>25+ 新 BOSS</li>
+          <li>2 个新可玩角色</li>
+          <li>5 个新挑战、100+ 新成就</li>
+        </ul>
+
+        <h5>忏悔+ · Repentance+</h5>
+        <p class="gd-meta">官方发行日 2024 年 11 月 18 日 · <b>免费</b>（10 周年更新）</p>
+        <ul>
+          <li>新的<b>在线多人</b>模式：快速匹配、公开匹配、好友匹配、在线每日挑战</li>
+          <li><b>表情轮盘</b>与聊天，用于在线队友之间沟通</li>
+          <li>与在线游玩相关的新成就</li>
+          <li>大量物品增强与平衡性调整</li>
+        </ul>
+
+        <h5>一句话区分</h5>
+        <table class="gd-table">
+          <tr><td><b>AB</b></td><td>加内容（贪婪模式是标志）</td></tr>
+          <tr><td><b>AB+</b></td><td>加内容 + <b>开放 Mod 支持</b></td></tr>
+          <tr><td><b>忏悔</b></td><td>内容与机制的大重构，官方称包含前三部全部内容</td></tr>
+          <tr><td><b>忏悔+</b></td><td>免费，主打<b>在线联机</b></td></tr>
+        </table>
+
+        <h5>依赖关系（各官方页面原文）</h5>
+        <ul class="gd-quote">
+          <li>AB+ 页面：<code>The Binding of Isaac: Rebirth AND Afterbirth ARE REQUIRED FOR AFTERBIRTH+ DLC!</code></li>
+          <li>忏悔 页面：<code>featuring all content from the Rebirth, Afterbirth and Afterbirth+ expansions</code></li>
+          <li>忏悔+ 页面：<code>this FREE DLC update</code>（10 周年免费更新）</li>
+        </ul>
+      </section>
+
+      <!-- ---------- 二、语言设置 ---------- -->
+      <section class="gd-sec" data-gd="2" hidden>
+        <h5>官方中文是哪来的</h5>
+        <p>游戏自带官方简体中文，来自<b>忏悔（Repentance）</b>层级的语言包。游戏自带的官方更新日志
+          （v1.7.5，2021 年 11 月 10 日）原话是：</p>
+        <div class="gd-quote">
+          <p>The game has been updated with partial support for the following languages:
+             Japanese, Korean, Spanish, German, Russian and <b>Simplified Chinese</b>.</p>
+          <p>Please note that these language patches are still incomplete and subject to change.</p>
+        </div>
+        <p>游戏文件里对应的语言包是 <code>resources/packed/repentance_zh.a</code>。</p>
+
+        <h5>怎么切换成中文</h5>
+        <ol class="gd-steps">
+          <li>进入游戏<b>主菜单</b>（先别急着进存档）</li>
+          <li>打开 <b>Options</b>（选项）</li>
+          <li>找到 <b>Language</b>（语言），左右切换，选到<b>简体中文</b></li>
+        </ol>
+        <div class="gd-note">要改的是<b>主菜单里的 Options</b>。进游戏之后按 Esc 出现的暂停设置里没有语言这一项。</div>
+
+        <h5>如果语言列表里没有中文</h5>
+        <ul>
+          <li>先确认游戏版本已更新到较新的版本，并且已经安装<b>忏悔（Repentance）</b>——
+            官方中文在忏悔层级的语言包里，更早的版本（只有本体 / AB / AB+）没有官方中文</li>
+          <li>官方日志同时说明这些语言包"仍不完整、后续可能变动"</li>
+          <li>在更早的版本上，中文社区的做法是通过创意工坊订阅汉化 Mod</li>
+        </ul>
+
+<!-- ===== 追加到「语言设置」章节末尾的小节 ===== -->
+        <h5>在忏悔+（beta）上用中文：靠工坊 Mod 注入替换</h5>
+        <p><b>为什么忏悔+ 要特殊处理</b>：官方中文在忏悔层级是有的，但<b>忏悔+ 是 beta 测试版，
+          官方把本地化功能关掉了</b>；而普通 Mod 只能改 <code>content/</code> 下的资源，
+          <b>改不了游戏本体的打包文件</b>（<code>resources/packed/*.a</code>）。
+          所以中文社区的做法是订阅一个<b>会注入游戏文件</b>的补丁 Mod。</p>
+
+        <p>补丁作者（IsaacLangUnlocker / 工坊里的中文补丁）对原理的说明：</p>
+        <div class="gd-quote">
+          <p>This sloppy project can be used to enable isaac's localization feature,
+             <b>which was disabled in the rep+ beta test</b>.</p>
+          <p>Player is required to run <code>patcher.exe</code> at the first time. The patcher
+             replace the string <code>userenv.dll</code> to <code>bootstp.dll</code> inside the
+             <code>isaac-ng.exe</code>, and extract a <code>bootstp.dll</code>.</p>
+        </div>
+
+        <h5>操作步骤</h5>
+        <ol class="gd-steps">
+          <li>在 Steam 创意工坊里订阅中文补丁 Mod（例如 <code>CN Patch for Rep+</code>）</li>
+          <li><b>首次需要手动运行一次</b>补丁目录里的 <code>patcher.exe</code> ——
+            它会修改游戏主程序（把 <code>isaac-ng.exe</code> 里引用的 <code>userenv.dll</code>
+            换成 <code>bootstp.dll</code>，并释放出 <code>bootstp.dll</code>）</li>
+          <li>之后照常启动游戏：每次启动时 mod loader 会把补丁目录里的 <code>inject.bin</code>
+            同步成游戏目录的 <code>language_unlocker.dll</code> 并加载它，由它替换游戏资源</li>
+          <li>语言不用手动选 —— 补丁默认已经把语言 ID 固定在简体中文上
+            （见下面的 <code>lang=13</code>）</li>
+        </ol>
+
+        <h5>补丁会改动哪些文件（可在游戏目录自查）</h5>
+        <table class="gd-table">
+          <tr><td>isaac-ng.exe</td><td>主程序被改（<code>userenv.dll</code> → <code>bootstp.dll</code>）</td></tr>
+          <tr><td>bootstp.dll</td><td>新增；游戏启动时加载的 mod loader</td></tr>
+          <tr><td>language_unlocker.dll</td><td>每次启动从补丁目录的 <code>inject.bin</code> 同步而来</td></tr>
+          <tr><td>resources/packed/repentance_zh.a</td><td>简体中文语言包（补丁会替换它）</td></tr>
+          <tr><td>config.ini</td><td>补丁配置文件</td></tr>
+        </table>
+        <div class="gd-note">补丁目录里 <code>res/</code> 下会有一组 <code>*.copy</code> 文件，
+          那是补丁要写进游戏的内容；<code>inject.bin</code> 与游戏目录里的
+          <code>language_unlocker.dll</code> 大小一致。</div>
+
+        <h5>配置项（一般不用动）</h5>
+        <p>补丁自带的中文注释配置（<code>&lt;补丁目录&gt;/res/config.ini</code>）原文：</p>
+        <div class="gd-quote">
+          <p><code>fixinput=1</code> # 修改此值以开关输入法修正功能。0：不修正输入法 1：修正输入法</p>
+          <p><code>lang=13</code> # 强制覆盖的语言ID，可省略，默认13，设为其它数字将加载其它语言</p>
+        </div>
+        <p>补丁还支持在游戏内用 <b>Mod Config Menu</b> 调整（输入法修正、免死、表情等）；
+          没装 MCM 也能正常用，只是没有那个设置界面。</p>
+
+        <h5>⚠️ 安全须知（作者本人的声明）</h5>
+        <ul>
+          <li>这类补丁会<b>修改游戏主程序</b>，并且<b>每次启动都会联网更新并加载一个 dll</b>；
+            作者自称这是 <i>a DAMOCLES</i>，并提示更新弹窗可以点 <i>No</i> 拒绝更新</li>
+          <li>作者也提醒：可能被杀毒软件误报</li>
+          <li>因此务必<b>只从创意工坊里作者发布的条目订阅</b>，不要用来路不明的压缩包</li>
+          <li>想恢复原状：取消订阅该补丁，然后在 Steam 里右键游戏 →
+            属性 → 已安装文件 → <b>验证游戏文件完整性</b>（会修回被改的主程序）</li>
+        </ul>
+      </section>
+
+      <!-- ---------- 三、工坊打 Mod ---------- -->
+      <section class="gd-sec" data-gd="3" hidden>
+        <h5>前提</h5>
+        <p>需要拥有 <b>Rebirth + Afterbirth + Afterbirth+</b> —— Mod 支持从 AB+ 开始
+          （Modding of Isaac 官方 FAQ 原文：<i>you need the basegame "Rebirth", the first DLC
+          "Afterbirth" and the second DLC "Afterbirth+" installed to use mods</i>）。</p>
+
+        <h5>装 Mod 的步骤</h5>
+        <ol class="gd-steps">
+          <li>在 Steam 库里进入《The Binding of Isaac: Rebirth》的<b>创意工坊</b></li>
+          <li>找到想要的 Mod，点「<b>订阅</b>」（Subscribe）—— 官方 FAQ 的原话是
+            <i>"Simply press the subscribe button on the Workshop page. This will automatically
+            download and install the mod."</i></li>
+          <li><b>重新启动游戏</b></li>
+          <li>这时 Mod 会出现在<b>主菜单的 mods 菜单</b>里，可以在那里启用或停用</li>
+        </ol>
+
+        <h5>在游戏里启用 / 停用</h5>
+        <ul>
+          <li>打开主菜单的 <b>mods</b> 菜单，就能看到已安装的 Mod</li>
+          <li>在<b>忏悔+</b> 里需要按 <b>Tab</b> 打开 Mod 列表</li>
+          <li>在列表里：<b>Tab</b> 批量开关全部 Mod，<b>空格</b>单独开关某一个</li>
+        </ul>
+
+        <h5>文件放在哪</h5>
+        <ul>
+          <li>Steam 下载的原始内容在：<code>&lt;Steam库&gt;/steamapps/workshop/content/250900/&lt;工坊ID&gt;/</code></li>
+          <li>游戏会把它同步到自己目录下的 <code>mods</code> 文件夹，命名形如 <code>&lt;名字&gt;_&lt;工坊ID&gt;</code>
+            （游戏启动日志里能看到 <code>LOADED MOD .../mods/xxx_123456/content/</code>）</li>
+        </ul>
+
+        <h5>⚠ 成就提醒</h5>
+        <ul>
+          <li><b>第一次击败妈腿（Necropolis / Depths 2 的 BOSS）之前，不要开启任何 Mod 和控制台</b>，
+            否则这一存档不解锁成就</li>
+          <li>之后就不影响了 —— 官方 FAQ 原话：<i>Mods don't disable achievements, as long as you have
+            killed mom ... at least once on the savefile</i>（同一存档击杀过一次即可）</li>
+        </ul>
+      </section>
+
+      <!-- ---------- 四、用本管理器 ---------- -->
+      <section class="gd-sec" data-gd="4" hidden>
+        <p class="gd-lead">本管理器不替代 Steam，而是把「下载 → 归位 → 启用」这几步自动化，
+          并让每个 Mod 只在你自己的仓库里存一份。</p>
+
+        <h5>1. 找到想要的 Mod</h5>
+        <p>顶栏点 <b>「⌕ 搜索工坊」</b>，可以直接搜 Steam 创意工坊（中英文关键词都行）。
+          点任意一个结果查看详情。</p>
+
+        <h5>2. 下载到自己的仓库</h5>
+        <p>在详情弹窗里点 <b>「↓ 下载到我的仓库」</b>：</p>
+        <ol class="gd-steps">
+          <li>程序会唤起 Steam 的工坊页面（以撒的工坊内容是文件夹形式，Steam 不对它开放直链，
+            所以只能由 Steam 客户端来下载）</li>
+          <li>在 Steam 里点一下 <b>「订阅」</b></li>
+          <li>下载完成后程序会<b>自动导入</b>到你的 Mod 仓库，建好链接并直接启用</li>
+        </ol>
+        <p>如果 Steam 里已经下载过了，改用 <b>「导入已下载的」</b> 可以跳过订阅，直接入库。</p>
+
+        <h5>3. 启用 / 停用</h5>
+        <p>每张卡片上的开关可以单独启用或停用；勾选多张卡片可以批量操作；顶栏也有全开 / 全关。</p>
+        <div class="gd-note">改完需要<b>重启游戏</b>才会重新加载 Mod。</div>
+
+        <h5>4. 分组与一键切换</h5>
+        <p>可以把 Mod 归到不同分组（例如按版本分「忏悔通用」「忏悔+」），右键分组还能调整优先级
+          —— 优先级高的组会排在前面。</p>
+        <p>需要整套换 Mod 时，用分组的 <b>「仅启用此组」</b> 一键切换，不必逐个点开关。</p>
+
+        <h5>5. 仓库与链接</h5>
+        <p>Mod 本体放在你指定的仓库目录里，游戏目录的 <code>mods</code> 里放的是指向仓库的<b>链接</b>。所以：</p>
+        <ul>
+          <li>同一个 Mod 只占一份空间，不会出现两份副本</li>
+          <li>停用只是移掉链接，本体始终留在仓库里，随时可以再启用</li>
+          <li>不会和 Steam 自己往 <code>mods</code> 里塞的那份打架</li>
+        </ul>
+      </section>
+    </div>
+
+    <div class="gd-foot">
+      <span>以上「版本区别 / 语言设置 / 工坊打 Mod」三节整理自 Steam 商店页官方描述、游戏自带
+        官方更新日志（changelog.txt）与 Modding of Isaac 官方 FAQ。</span>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 创意工坊搜索面板 ============ -->
+<div class="wsp-root" id="wsPanel" hidden>
+  <div class="wsp-backdrop" data-wsp-close="1"></div>
+  <div class="wsp-box">
+    <div class="wsp-head">
+      <div class="wsp-title">创意工坊搜索 <span class="wsp-sub">The Binding of Isaac: Rebirth</span></div>
+      <div class="wsp-form">
+        <input type="text" id="wsQuery" placeholder="搜索 mod（中英文都行，留空=浏览全部）" autocomplete="off">
+        <button class="btn green" id="wsGo">查询</button>
+        <button class="btn ghost" id="wsReset">重置</button>
+        <button class="btn ghost" id="wsClose">关闭</button>
+      </div>
+    </div>
+    <div class="wsp-bar">
+      <div class="wsp-sorts" id="wsSorts">
+        <button class="wsp-sort is-active" data-sort="trend">热门</button>
+        <button class="wsp-sort" data-sort="recent">最新</button>
+        <button class="wsp-sort" data-sort="top">评分最高</button>
+      </div>
+      <div class="wsp-meta"><span id="wsCount">—</span><span id="wsNote" class="wsp-note"></span></div>
+    </div>
+    <div class="wsp-grid" id="wsResults"></div>
+    <div class="wsp-foot">
+      <button class="btn ghost" id="wsPrev">‹ 上一页</button>
+      <span id="wsPage">第 1 页</span>
+      <button class="btn ghost" id="wsNext">下一页 ›</button>
+    </div>
+  </div>
+</div>
+<div class="tooltip glass" id="tooltip" hidden></div>
+
+<script src="/web/app.js"></script>
+</body>
+</html>

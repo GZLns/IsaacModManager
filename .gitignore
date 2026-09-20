@@ -1,0 +1,28 @@
+# ---- 构建产物 ----
+build/
+dist/
+release/
+*.spec
+
+# ---- 项目记忆 / 会话数据 (绝不上传) ----
+.workbuddy/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---- 本地数据 / 配置 (绝不入库) ----
+isaac_mod_manager_config.json
+isaac_mod_manager_config.*.json
+isaac_mod_manager.log
+
+# 合并了本机系统根证书的 CA 包(各家机器不同, 需要时用 tools/make_ca_bundle.py 生成)
+certs/*.pem
+
+# 开发时的临时截图 / 抓取结果
+ui_*.png
+_*.png
+_dom.html
+_*.txt
