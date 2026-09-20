@@ -66,6 +66,7 @@ mods = os.path.join(game, "mods")
 lib = os.path.join(game, "isaac_mod_library")
 os.makedirs(mods)
 os.makedirs(lib)
+m.USER_DIR = tmp          # 让 v2 的本地缓存也写到沙盒, 不碰用户真实数据
 for name in ["Alpha_1", "Beta_2", "Gamma_3", "Delta_4"]:
     p = os.path.join(mods, name)
     os.makedirs(p)
@@ -825,12 +826,13 @@ check("foot-right" in html_src and ".foot-right" in css_src, "设置/退出按�
 section("数据目录 (配置/分组/凭据不再写在 exe 旁边)")
 
 check(os.path.basename(m.CONFIG_PATH) == "config.json"
-      and os.path.basename(m.USER_DIR) == "IsaacModManager",
+      and os.path.basename(os.path.dirname(m.CONFIG_PATH)) == "IsaacModManager",
       "配置在用户数据目录: %LOCALAPPDATA%\\IsaacModManager\\config.json",
       m.CONFIG_PATH.replace(os.path.expanduser("~"), "~"))
 check(os.path.normcase(os.path.dirname(m.CONFIG_PATH)) != os.path.normcase(m.APP_DIR),
       "配置不再写在程序旁边(这是以前丢分组的根因)")
-check(os.path.normcase(os.path.dirname(m.LOG_PATH)) == os.path.normcase(m.USER_DIR),
+check(os.path.normcase(os.path.dirname(m.LOG_PATH))
+      == os.path.normcase(os.path.dirname(m.CONFIG_PATH)),
       "日志也放数据目录(Program Files 下也能写)")
 
 for _fn in ("user_data_dir", "migrate_legacy_config", "resolve_config_path",
@@ -871,6 +873,59 @@ except OSError:
     _usr_after = None
 check(_usr_after == _REAL_USER_CFG_BEFORE,
       "用户数据目录的 config.json 未被测试改动")
+
+
+# ================================================================ v2.0 新功能
+section("v2.0: 冲突检测 / 工坊缓存 / 更新提醒 / 自动排序 / 备份")
+
+check(m.APP_VERSION == "2.0.0", "版本号是 2.0.0", m.APP_VERSION)
+check(os.path.isfile(os.path.join(ROOT, "modcache.py")), "本地缓存模块 modcache.py 存在")
+check("modcache" in py_src, "主程序接入了缓存模块")
+check("cache.db" in io.open(os.path.join(ROOT, "modcache.py"), encoding="utf-8").read(),
+      "缓存落在数据目录的 cache.db")
+
+for _fn in ("conflict_scan", "ensure_conflicts", "_mod_conflict_files", "check_updates",
+            "update_state", "auto_sort", "apply_load_order", "clear_load_order",
+            "sort_rules", "set_sort_rules", "backup_now", "list_backups", "_auto_backup"):
+    check(hasattr(m.ModLibrary, _fn), "ModLibrary.%s()" % _fn)
+check(hasattr(m, "check_self_update"), "存在 check_self_update()")
+check(hasattr(m, "_ver_tuple"), "存在版本比较 _ver_tuple()")
+check(m._ver_tuple("2.0.0") > m._ver_tuple("1.9.9"), "版本比较按数字(不是字符串)")
+check(m.APP_REPO == "GZLns/IsaacModManager", "自身更新指向正确的仓库")
+
+# 冲突检测的关键设计: 只算子目录里的资源文件
+check("CONFLICT_EXTS" in py_src and ".anm2" in py_src, "冲突检测覆盖 .anm2 等资源类型")
+check("根目录的 main.lua" in py_src or "根目录" in py_src, "说明里点明「根目录文件不算冲突」")
+# 排序落到链接名, 而不是搬动仓库实体
+check("_SEQ_RE" in py_src and "apply_load_order" in py_src, "排序通过给链接加序号前缀实现")
+check("link" in py_src.split("def state")[0] or "rec.get(\"link\")" in py_src,
+      "链接名与仓库目录名解耦(改名不会丢 mod)")
+
+# 工坊缓存与限流
+check("rate_allow" in py_src and "mark_dead" in py_src, "工坊查询带限流与失效标记")
+check("max_age" in py_src, "工坊查询支持缓存新鲜度")
+_mc = io.open(os.path.join(ROOT, "modcache.py"), encoding="utf-8").read()
+check("WORKSHOP" in _mc.upper() or "ratelog" in _mc, "限流表在缓存模块里")
+check("def rate_allow" in _mc and "def get_fingerprint" in _mc, "缓存层提供限流与指纹")
+
+# 备份
+check("backup_keep" in py_src, "备份份数可配置")
+check("backup_enabled" in py_src, "备份开关可配置")
+check("_auto_backup" in py_src and "before-batch" in py_src, "批量操作前会自动备份")
+
+# 前端接线
+check(all(k in js for k in ("btnConflicts", "btnSort", "btnUpdates")), "顶栏有三个新按钮")
+check(all(k in js for k in ("openConflicts", "openSort", "checkWsUpdates", "checkAppUpdate")),
+      "前端有对应的面板与检查函数")
+check("renderBadges" in js and "cfBadge" in js, "角标会随状态刷新")
+check("sBackup" in js and "sBkNow" in js, "设置里有备份开关与「立即备份」")
+check("badge cf" in js and "m.conflicts" in js, "卡片按 mod 显示冲突角标")
+check("#conflicts" in js and "#sort" in js, "冲突/排序有直达入口")
+
+for _ep in ("/api/conflicts", "/api/updates/check", "/api/sort/preview", "/api/sort/apply",
+            "/api/sort/clear", "/api/sort/rules", "/api/app/update",
+            "/api/backup/create", "/api/backup/list"):
+    check(_ep in py_src, "后端路由 " + _ep)
 
 
 # ================================================================ 收尾

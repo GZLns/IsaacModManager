@@ -10,6 +10,7 @@ const state = {
   selected: new Set(),
   filter: 'all', sort: 'name', search: '',
   showDisabled: true, loading: true,
+  conflicts: null, updates: null, appUpdate: null,
 };
 
 /* ---------------- 小工具 ---------------- */
@@ -28,6 +29,8 @@ function apply(s) {
   state.stats = s.stats || {};
   state.cfg = s.cfg || {};
   state.logs = s.logs || [];
+  state.conflicts = s.conflicts || { count: 0, items: [] };
+  state.updates = s.updates || { count: 0, items: [] };
   state.loading = false;
 }
 
@@ -196,7 +199,10 @@ function visibleMods() {
 
 function badgeFor(m) {
   if (m.dead_link) return '<span class="badge dead">失效链接</span>';
-  if (m.state === 'enabled') return '<span class="badge on"><i class="dot"></i>已启用</span>';
+  // 多个 mod 改同一个文件时给个角标提醒(点顶栏「⚠ 冲突」看详情)
+  const cf = m.conflicts
+    ? `<span class="badge cf" title="有 ${m.conflicts} 个文件与其它 mod 重叠">⚠ ${m.conflicts}</span>` : '';
+  if (m.state === 'enabled') return cf + '<span class="badge on"><i class="dot"></i>已启用</span>';
   if (m.state === 'unimported') return '<span class="badge raw">未导入</span>';
   return '<span class="badge off">已停用</span>';
 }
@@ -314,7 +320,228 @@ function renderPath() {
   document.querySelector('.bg').style.display = c.has_bg ? '' : 'none';
 }
 
-function render() { renderNav(); renderGrid(); renderPath(); }
+function render() { renderNav(); renderGrid(); renderPath(); renderBadges(); }
+
+/* 顶栏那几个"有情况"的角标: 冲突数 / 可更新数 / 程序自身有没有新版 */
+function renderBadges() {
+  const cf = (state.conflicts && state.conflicts.count) || 0;
+  const up = (state.updates && state.updates.count) || 0;
+  const cfB = $('cfBadge'), upB = $('upBadge');
+  if (cfB) { cfB.hidden = !cf; cfB.textContent = cf; }
+  if (upB) { upB.hidden = !up; upB.textContent = up; }
+  const b1 = $('btnConflicts'), b2 = $('btnUpdates'), b3 = $('btnSettings');
+  if (b1) b1.classList.toggle('hot', cf > 0);
+  if (b2) b2.classList.toggle('hot', up > 0);
+  if (b3) b3.classList.toggle('hot', !!(state.appUpdate && state.appUpdate.newer));
+}
+
+/* ---------------- ⚠ 冲突检测 ---------------- */
+async function openConflicts(force = true) {
+  let data = state.conflicts;
+  try {
+    if (force || !data) {
+      setStatus('正在检查文件重叠…');
+      const r = await api('/api/conflicts', { force: !!force });
+      data = r.conflicts;
+      state.conflicts = data;
+      renderBadges();
+      setStatus('就绪');
+    }
+  } catch (e) { setStatus('就绪'); return toast(e.message || '检测失败', 'err'); }
+  const items = (data && data.items) || [];
+  if (!items.length) {
+    return modal(`<h3>⚠ 冲突检测</h3>
+      <div style="color:var(--fg-soft);line-height:1.9">
+        没有发现冲突 —— 当前启用的 mod 之间没有文件重叠，可以放心。</div>
+      <div style="color:var(--fg-soft);font-size:12.5px;line-height:1.7;margin-top:10px">
+        检测范围：各个 mod 子目录里的 <code>.png / .anm2 / .wav / .lua</code>
+        （根目录的 <code>main.lua</code>、<code>metadata.xml</code> 每个 mod 都有，不算冲突）。</div>
+      <div class="modal-actions">
+        <button class="btn ghost" id="cfAgain">重新检测</button>
+        <button class="btn green" id="cfOk">知道了</button></div>`, (box) => {
+      box.querySelector('#cfAgain').onclick = () => { closeModal(); openConflicts(true); };
+      box.querySelector('#cfOk').onclick = closeModal;
+    });
+  }
+  modal(`<h3>⚠ 发现 ${items.length} 处文件重叠</h3>
+    <div style="color:var(--fg-soft);font-size:12.5px;line-height:1.8;margin-bottom:12px">
+      同一个资源文件被多个 mod 修改时，游戏只会用<b>排在后面</b>的那个 —— 想让某个 mod 生效，
+      就用「⇅ 排序」把它放到后面。</div>
+    <div class="cf-list">${items.slice(0, 60).map(it => `
+      <div class="cf-item">
+        <div class="cf-path">${esc(it.path)}</div>
+        <div class="cf-mods">${(it.names || []).map(n => `<span class="cf-mod">${esc(n)}</span>`).join('')}</div>
+      </div>`).join('')}</div>
+    ${items.length > 60 ? `<div style="color:var(--fg-soft);font-size:12px;margin-top:8px">只显示前 60 处，共 ${items.length} 处</div>` : ''}
+    <div class="modal-actions">
+      <button class="btn ghost" id="cfAgain">重新检测</button>
+      <button class="btn green" id="cfOk">关闭</button></div>`, (box) => {
+    box.querySelector('#cfAgain').onclick = () => { closeModal(); openConflicts(true); };
+    box.querySelector('#cfOk').onclick = closeModal;
+  });
+}
+
+/* ---------------- ⇅ 加载顺序(规则 + 拓扑排序) ---------------- */
+async function openSort() {
+  const byDir = {}; state.mods.forEach(m => { byDir[m.dir] = m; });
+  const nameOf = d => (byDir[d] && byDir[d].name) || d;
+  let rules = [], prev = {};
+  try {
+    const a = await api('/api/sort/rules', {});
+    rules = a.rules || [];
+    const b = await api('/api/sort/preview', {});
+    prev = b.sort || {};
+  } catch (e) { return toast(e.message || '读取失败', 'err'); }
+
+  const enabled = state.mods.filter(m => m.state === 'enabled');
+  const opt = (sel) => enabled.map(m =>
+    `<option value="${esc(m.id || '')}" ${sel === m.id ? 'selected' : ''}>${esc(m.name)}${m.id ? '' : ' (无工坊ID)'}</option>`).join('');
+  const optAll = (sel) => state.mods.map(m =>
+    `<option value="${esc(m.id || '')}" ${sel === m.id ? 'selected' : ''}>${esc(m.name)}${m.id ? '' : ' (无ID)'}</option>`).join('');
+
+  const render = (box) => {
+    const order = prev.order || [];
+    const cycles = prev.cycles || [];
+    box.querySelector('#srList').innerHTML = rules.length
+      ? rules.map((r, i) => `<div class="sr-row">
+          <span class="sr-main">${esc(nameOf(Object.keys(byDir).find(d => byDir[d].id === r.id) || r.id))}</span>
+          ${r.after && r.after.length ? `<span class="sr-tag">排在之后</span><span class="sr-other">${r.after.map(id => esc(nameOf(Object.keys(byDir).find(d => byDir[d].id === id) || id))).join('、')}</span>` : ''}
+          ${r.before && r.before.length ? `<span class="sr-tag">排在之前</span><span class="sr-other">${r.before.map(id => esc(nameOf(Object.keys(byDir).find(d => byDir[d].id === id) || id))).join('、')}</span>` : ''}
+          <button class="more" data-del="${i}" title="删除这条规则">✖</button>
+        </div>`).join('')
+      : '<div style="color:var(--fg-soft);font-size:12.5px">还没有规则。例如「A 必须排在 B 之后」，加一条即可。</div>';
+    box.querySelector('#srOrder').innerHTML = order.length
+      ? order.map((d, i) => `<div class="sr-item"><span class="sr-n">${String(i + 1).padStart(3, '0')}</span>${esc(nameOf(d))}</div>`).join('')
+      : '<div style="color:var(--fg-soft);font-size:12.5px">当前没有已启用的 mod。</div>';
+    box.querySelector('#srCycles').innerHTML = cycles.length
+      ? `<div class="sr-warn">⚠ 这 ${cycles.length} 个 mod 之间存在循环依赖，已原样放在末尾：${cycles.map(d => esc(nameOf(d))).join('、')}</div>` : '';
+    box.querySelectorAll('[data-del]').forEach(b => {
+      b.onclick = async () => {
+        const i = Number(b.dataset.del);
+        const next = rules.slice(); next.splice(i, 1);
+        await api('/api/sort/rules', { rules: next });
+        closeModal(); openSort();
+      };
+    });
+  };
+
+  modal(`<h3>⇅ 加载顺序</h3>
+    <div style="color:var(--fg-soft);font-size:12.5px;line-height:1.8;margin-bottom:10px">
+      游戏按 mods/ 里文件夹名的顺序加载。这里用「谁必须排在谁之后」的规则算出一个顺序，
+      应用时只改 <b>mods/ 里的链接名</b>（加 001_ 这样的前缀），仓库里的实体不动。</div>
+
+    <div class="sr-add">
+      <select id="srA">${opt()}</select>
+      <span class="sr-txt">必须排在</span>
+      <select id="srB">${optAll()}</select>
+      <span class="sr-txt">之后</span>
+      <button class="btn ghost" id="srAdd">＋ 添加规则</button>
+    </div>
+    <div id="srList" class="sr-list"></div>
+    <div id="srCycles"></div>
+
+    <div class="sr-head">顺序预览</div>
+    <div id="srOrder" class="sr-order"></div>
+
+    <div class="modal-actions">
+      <button class="btn ghost" id="srClear" style="margin-right:auto">清除顺序前缀</button>
+      <button class="btn ghost" id="srClose">关闭</button>
+      <button class="btn green" id="srApply">应用顺序</button></div>`, (box) => {
+    render(box);
+    box.querySelector('#srAdd').onclick = async () => {
+      const a = box.querySelector('#srA').value, b = box.querySelector('#srB').value;
+      if (!a || !b) return toast('这两项都需要选择（且 mod 要有工坊 ID）', 'err');
+      if (a === b) return toast('不能让一个 mod 排在自己之后', 'err');
+      const next = rules.slice();
+      const hit = next.find(r => r.id === a);
+      if (hit) { hit.after = Array.from(new Set([...(hit.after || []), b])); }
+      else { next.push({ id: a, after: [b] }); }
+      await api('/api/sort/rules', { rules: next });
+      closeModal(); openSort();
+    };
+    box.querySelector('#srClose').onclick = closeModal;
+    box.querySelector('#srApply').onclick = async () => {
+      closeModal();
+      const r = await call('/api/sort/apply', {});
+      if (r && r.sort) toast('已应用加载顺序（%d 个链接重命名）'.replace('%d', r.sort.changed));
+    };
+    box.querySelector('#srClear').onclick = async () => {
+      closeModal();
+      const r = await call('/api/sort/clear', {});
+      if (r && r.sort) toast('已清除顺序前缀（%d 个）'.replace('%d', r.sort.changed));
+    };
+  });
+}
+
+/* ---------------- ⟳ mod 更新检查 ---------------- */
+async function checkWsUpdates(markSeen) {
+  setStatus('正在检查 mod 更新…');
+  let res = null;
+  try { res = await api('/api/updates/check', { mark_seen: !!markSeen }); }
+  catch (e) { setStatus('就绪'); return toast(e.message || '检查失败', 'err'); }
+  setStatus('就绪');
+  const d = res.ws_updates || {};
+  if (d.error) return toast(d.error, 'err');
+  const items = d.updates || [];
+  state.updates = { count: items.length, items };
+  renderBadges();
+  if (!items.length) return toast(`已检查 ${d.checked} 个 mod，都是最新的`);
+  modal(`<h3>⟳ 有 ${items.length} 个 mod 出了新版本</h3>
+    <div style="color:var(--fg-soft);font-size:12.5px;line-height:1.8;margin-bottom:12px">
+      创意工坊上的更新时间比本地记录的新。更新方式：在 Steam 里打开该 mod 页面重新订阅，
+      或按应用内的「下载到我的仓库」流程走一遍。</div>
+    <div class="sr-list">${items.map(u => `
+      <div class="sr-row">
+        <span class="sr-main">${esc(u.name)}</span>
+        <span class="sr-other">${new Date(u.was * 1000).toLocaleDateString()} → ${new Date(u.now * 1000).toLocaleDateString()}</span>
+        <button class="more" data-open="${esc(u.url)}" title="在工坊打开">↗</button>
+      </div>`).join('')}</div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="upSeen">标记为已知</button>
+      <button class="btn green" id="upOk">关闭</button></div>`, (box) => {
+    box.querySelectorAll('[data-open]').forEach(b => {
+      b.onclick = () => window.open(b.dataset.open, '_blank');
+    });
+    box.querySelector('#upSeen').onclick = async () => { closeModal(); await checkWsUpdates(true); };
+    box.querySelector('#upOk').onclick = closeModal;
+  });
+}
+
+/* ---------------- 程序自身更新 ---------------- */
+async function checkAppUpdate(silent) {
+  try {
+    const r = await api('/api/app/update', {});
+    const u = r.app_update || {};
+    state.appUpdate = u;
+    renderBadges();
+    if (u.ok && u.newer) {
+      toast(`发现新版本 v${u.latest}（当前 v${u.current}）—— 点左下角 ⚙ 可查看`, 'ok');
+    } else if (!silent) {
+      toast(u.ok ? `已是最新版本 v${u.current}` : (u.error || '检查失败'), u.ok ? '' : 'err');
+    }
+  } catch (e) { if (!silent) toast(e.message || '检查失败', 'err'); }
+}
+
+function openAppUpdate() {
+  const u = state.appUpdate || {};
+  modal(`<h3>关于 / 更新</h3>
+    <div style="line-height:1.9">
+      当前版本：<b>v${esc(u.current || '2.0.0')}</b>
+      ${u.ok && u.latest ? `<br>最新版本：<b>v${esc(u.latest)}</b>${u.newer ? ' <span style="color:#ffd479">（有新版本）</span>' : ' <span style="color:#5fd97e">（已是最新）</span>'}` : ''}
+      ${u.published ? `<br>发布时间：${esc(u.published)}` : ''}
+    </div>
+    ${u.newer ? `<div class="modal-actions" style="margin-top:12px">
+        <button class="btn green" id="auGo">打开发布页下载</button>
+        <button class="btn ghost" id="auOk">关闭</button></div>`
+      : `<div class="modal-actions" style="margin-top:12px">
+        <button class="btn ghost" id="auChk">立即检查</button>
+        <button class="btn green" id="auOk">关闭</button></div>`}`, (box) => {
+    const go = box.querySelector('#auGo'), chk = box.querySelector('#auChk');
+    if (go) go.onclick = () => window.open(u.url || 'https://github.com/GZLns/IsaacModManager/releases', '_blank');
+    if (chk) chk.onclick = async () => { closeModal(); await checkAppUpdate(false); setTimeout(openAppUpdate, 600); };
+    box.querySelector('#auOk').onclick = closeModal;
+  });
+}
 
 /* ---------------- 交互 ---------------- */
 function ripple(e, el) {
@@ -1057,6 +1284,13 @@ function openSettings() {
     <div style="margin:-6px 0 12px;font-size:12px;color:#8b94a8;line-height:1.7">
       配置、分组、Steam 登录凭据都保存在这里（${c.portable ? '当前是<b>便携模式</b>，数据就在程序旁边' : '默认位置 <code>%LOCALAPPDATA%\\IsaacModManager</code>'}）。
       <b>换新版本的 exe 不会影响这些数据</b>；想备份就整个文件夹复制走。</div>
+    <div class="row"><label>操作前自动备份</label>
+      <label class="check"><input type="checkbox" id="sBackup" ${c.backup_enabled !== false ? 'checked' : ''}><span>开启</span></label>
+      <span class="val">保留 <input type="number" id="sKeep" min="1" max="99" value="${c.backup_keep || 10}" style="width:56px;padding:4px 6px;border-radius:7px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);color:#fff"> 份</span></div>
+    <div class="row"><label>备份 / 版本</label>
+      <button class="btn ghost" id="sBkNow">立即备份</button>
+      <button class="btn ghost" id="sBkDir">打开备份目录</button>
+      <button class="btn ghost" id="sUpd">检查更新</button></div>
     <div class="modal-actions">
       <button class="btn red" id="sQuit" style="margin-right:auto">退出程序</button>
       <button class="btn ghost" id="sCancel">取消</button>
@@ -1075,6 +1309,19 @@ function openSettings() {
     box.querySelector('#sPickData').onclick = () => call('/api/open_dir', { path: box.querySelector('#sData').value });
     box.querySelector('#sCancel').onclick = closeModal;
     box.querySelector('#sQuit').onclick = () => { closeModal(); quitApp(); };
+    box.querySelector('#sBkNow').onclick = async () => {
+      try {
+        const r = await api('/api/backup/create', { reason: 'manual' });
+        toast('已备份: ' + (r.backup || {}).name);
+      } catch (e) { toast(e.message || '备份失败', 'err'); }
+    };
+    box.querySelector('#sBkDir').onclick = async () => {
+      try {
+        const r = await api('/api/backup/list', {});
+        call('/api/open_dir', { path: (r.backups || {}).dir });
+      } catch (e) { toast(e.message || '打开失败', 'err'); }
+    };
+    box.querySelector('#sUpd').onclick = async () => { closeModal(); await checkAppUpdate(false); setTimeout(openAppUpdate, 500); };
     box.querySelector('#sSave').onclick = () => {
       closeModal();
       call('/api/settings', {
@@ -1083,6 +1330,8 @@ function openSettings() {
         bg_opacity: Number(bg.value) / 100,
         card_opacity: Number(card.value) / 100,
         bg_enabled: box.querySelector('#sBgOn').checked,
+        backup_enabled: box.querySelector('#sBackup').checked,
+        backup_keep: Number(box.querySelector('#sKeep').value) || 10,
       }, '设置已保存');
     };
   });
@@ -1128,6 +1377,9 @@ function bindChrome() {
     if (q) { $('wsQuery').value = decodeURIComponent(q); }
     setTimeout(() => openWsSearch(), 700);
   }
+  // #conflicts / #sort 直接打开对应面板
+  if (location.hash === '#conflicts') { setTimeout(() => openConflicts(true), 900); }
+  if (location.hash === '#sort') { setTimeout(() => openSort(), 900); }
   // #settings 直接打开设置(方便做快捷方式 / 截图验证)
   if (location.hash === '#settings') {
     setTimeout(openSettings, 600);
@@ -1141,8 +1393,13 @@ function bindChrome() {
     const n = location.hash.indexOf('=') > 0 ? location.hash.split('=')[1] : '1';
     setTimeout(() => openGuide(n), 600);
   }
+  $('btnConflicts').onclick = () => openConflicts(true);
+  $('btnSort').onclick = () => openSort();
+  $('btnUpdates').onclick = () => checkWsUpdates(false);
   $('btnQuit').onclick = quitApp;
   bindGuide();
+  // 启动后悄悄查一下有没有新版本(失败就算了, 不打扰使用)
+  setTimeout(() => checkAppUpdate(true), 2600);
   // 「Steam 已下载」: 把原本没有入口的 workshopSubscribed 接出来
   const _wl = $('btnWsList');
   if (_wl) _wl.onclick = workshopSubscribed;

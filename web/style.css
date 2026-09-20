@@ -527,3 +527,43 @@ body.no-blur .bg-blur{display:none}
 .gd-steps li{margin:7px 0}
 .gd-foot{padding:12px 22px 14px;border-top:1px solid rgba(255,255,255,.07);
   font-size:11.5px;line-height:1.65;color:var(--fg-dim)}
+
+
+/* ================= v2.0 新增: 冲突检测 / 排序 / 更新 ================= */
+/* 顶栏按钮上的数字角标 */
+.btn .nbadge{display:inline-block;min-width:17px;height:17px;line-height:17px;padding:0 4px;
+  margin-left:6px;border-radius:9px;background:#d5484f;color:#fff;font-size:11px;
+  font-weight:700;text-align:center}
+.btn.hot{border-color:rgba(255,212,121,.55);color:#ffd479}
+.badge.cf{background:rgba(213,72,79,.22);border-color:rgba(213,72,79,.5);color:#ffb3b8}
+
+/* 冲突清单 */
+.cf-list{max-height:46vh;overflow-y:auto;padding-right:4px}
+.cf-item{padding:8px 10px;margin-bottom:7px;border-radius:9px;background:rgba(255,255,255,.04);
+  border:1px solid rgba(255,255,255,.07)}
+.cf-path{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#c9c2ff;
+  word-break:break-all;line-height:1.5}
+.cf-mods{margin-top:5px;display:flex;flex-wrap:wrap;gap:6px}
+.cf-mod{font-size:11.5px;padding:2px 7px;border-radius:7px;
+  background:rgba(108,92,231,.18);color:#c9c2ff}
+
+/* 加载顺序面板 */
+.sr-add{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+.sr-add select{flex:1;min-width:110px;padding:6px 8px;border-radius:8px;
+  background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);color:#fff;font-size:13px}
+.sr-txt{font-size:12.5px;color:#a3adc2}
+.sr-list{max-height:24vh;overflow-y:auto;margin-bottom:10px}
+.sr-row{display:flex;gap:8px;align-items:center;padding:7px 10px;margin-bottom:6px;
+  border-radius:9px;background:rgba(255,255,255,.04);font-size:13px}
+.sr-main{font-weight:600;color:#fff}
+.sr-tag{font-size:11px;padding:2px 6px;border-radius:6px;
+  background:rgba(108,92,231,.2);color:#c9c2ff;white-space:nowrap}
+.sr-other{font-size:12px;color:#a3adc2;flex:1}
+.sr-head{font-size:12.5px;color:#a3adc2;margin:12px 0 6px}
+.sr-order{max-height:20vh;overflow-y:auto}
+.sr-item{display:flex;gap:8px;padding:4px 8px;font-size:12.5px;color:#dfe4ee}
+.sr-n{font-family:ui-monospace,Consolas,monospace;color:#8b94a8}
+.sr-warn{margin:6px 0;padding:8px 10px;border-radius:9px;font-size:12.5px;
+  background:rgba(213,72,79,.14);border:1px solid rgba(213,72,79,.4);color:#ffb3b8}
+.sr-row .more{background:none;border:none;color:#8b94a8;cursor:pointer;font-size:13px;padding:0 4px}
+.sr-row .more:hover{color:#ffb3b8}

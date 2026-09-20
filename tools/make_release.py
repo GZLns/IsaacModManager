@@ -25,9 +25,9 @@ PORTABLE_DIR = "IsaacModManager-portable"
 ZIP_NAME = "IsaacModManager-portable.zip"
 
 # 不该进分发包的文件(用户数据 / 日志 / 打包残留)
-SKIP_NAMES = {"isaac_mod_manager_config.json", "isaac_mod_manager.log"}
+SKIP_NAMES = {"isaac_mod_manager_config.json", "isaac_mod_manager.log", "cache.db"}
 SKIP_EXT = {".pyc", ".pyo"}
-SKIP_DIRS = {"__pycache__"}
+SKIP_DIRS = {"__pycache__", "backups", "thumbs"}
 
 
 def human(n):

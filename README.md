@@ -18,6 +18,12 @@
 | **一键下载** | 详情页点「下载到我的仓库」→ 唤起 Steam 客户端 → 自动守候下载完成 → 自动导入并启用 |
 | **导入已有 mod** | 三种来源都能收编：Steam 已下载的工坊内容 / 游戏展开出的实体文件夹 / 仓库里已有的 |
 | **Mod 入门说明页** | 版本区别（AB / AB+ / 忏悔 / 忏悔+）、游戏内语言设置、创意工坊打 Mod、本工具用法，以及「忏悔+ 上用官方中文」的注入方案 |
+| **⚠ 冲突检测** | 扫描所有已启用 mod 里的 `.png / .anm2 / .wav / .lua`，找出**多个 mod 修改同一个文件**的地方 —— 游戏只会用排在后面的那个，早发现早调整 |
+| **⇅ 加载顺序** | 用「A 必须排在 B 之后」的规则算拓扑顺序，应用时**只给 mods/ 里的链接加序号前缀**（`001_xxx`），仓库实体一个都不动 |
+| **⟳ mod 更新提醒** | 记住每个 mod 在工坊的更新时间，有新版就提示（可「标记为已知」） |
+| **本地缓存与限流** | 工坊元数据落 SQLite（默认 3 小时内不重复请求）；滑动窗口限流 **180 次 / 5 分钟**；已失效条目永久标记不再重试 |
+| **操作前自动备份** | 批量操作与排序前自动打包一份「配置 + mod 清单」快照，默认保留最近 10 份 |
+| **检查程序更新** | 启动时对比 GitHub 上的最新 Release，有新版本会提示 |
 | **界面个性化** | 背景画作、不透明度可调 |
 
 ---
@@ -27,6 +33,10 @@
 ![主界面](docs/screenshots/main.jpg)
 
 *主界面：左侧是分组与筛选，中间是 mod 卡片（一键启用/停用），顶栏是搜索、导入与工坊入口，左下角是启动游戏。*
+
+![冲突检测](docs/screenshots/conflicts.jpg)
+
+*⚠ 冲突检测：一眼看出哪些文件被多个 mod 同时修改（这是在一台真机上扫出来的 24 处重叠）。*
 
 ![工坊搜索](docs/screenshots/search.jpg)
 
@@ -56,15 +66,33 @@
 
 ---
 
+## 冲突检测怎么用（v2.0 新增）
+
+多个 mod 修改同一个游戏资源文件时，**只有排在后面的那个会生效**，前面的等于白装 ——
+而且很多时候表现是「贴图错乱 / 音效不对」，很难自己查出原因。
+
+点顶栏的 **⚠ 冲突**：
+
+- 扫描所有**已启用** mod 的子目录里的 `.png / .anm2 / .wav / .lua`
+- 列出每个被重复修改的文件，以及涉及的 mod（卡片上也会出现 `⚠ n` 角标）
+- 想决定谁生效，就用 **⇅ 排序** 把要生效的那个排到后面
+
+> 根目录的 `main.lua`、`metadata.xml` 每个 mod 都有，**不算冲突**（游戏本来就会分别加载）。
+> 检测结果带指纹缓存，目录没变就不会重新扫全盘。
+
+---
+
 ## 数据放在哪（重要）
 
 所有可写数据都在**用户数据目录**，**不在程序旁边**：
 
 ```
 %LOCALAPPDATA%\IsaacModManager\
-    config.json              配置与分组（你的 mod 分组就在这）
+    config.json              配置与分组（你的 mod 分组、排序规则就在这）
     steam_session.json       Steam 登录凭据（只有 token，不含密码）
+    cache.db                 工坊元数据 / 文件指纹 / 限流记录的本地缓存
     thumbs\                  工坊缩略图缓存
+    backups\                 操作前的自动备份（zip，可整个删）
     isaac_mod_manager.log    运行日志
 ```
 
@@ -134,15 +162,16 @@ python build.py both
 | `--no-browser` | 不自动打开浏览器 |
 | `--force-new` | 即使已有实例在跑也再起一个（默认复用已有实例） |
 
-**自检**：`python tests/selftest.py`（约 240 项，含沙盒端到端）、`python tests/test_search.py`、
-`python tests/test_datadir.py`
+**自检**：`python tests/selftest.py`（约 285 项，含沙盒端到端）、`python tests/test_v2.py`（新功能专项）、
+`python tests/test_search.py`、`python tests/test_datadir.py`、`python tests/test_exe_datadir.py`
 
 ---
 
 ## 项目结构
 
 ```
-isaac_mod_manager.py      主程序（HTTP 服务 + 界面后端 + Mod 库逻辑）
+isaac_mod_manager.py      主程序（HTTP 服务 + 界面后端 + Mod 库逻辑 + 冲突/排序/更新/备份）
+modcache.py               本地缓存（SQLite）：工坊元数据 / 文件指纹 / 加载顺序 / 限流
 build.py                  PyInstaller 打包脚本
 start_manager.bat         源码方式一键启动
 web/                      前端（index.html / app.js / style.css）

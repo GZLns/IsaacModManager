@@ -30,6 +30,7 @@ import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import xml.etree.ElementTree as ET
+import zipfile
 
 FROZEN = bool(getattr(sys, "frozen", False))
 if FROZEN:
@@ -171,6 +172,9 @@ def resolve_config_path(explicit=None, portable=False):
     return CONFIG_PATH
 
 
+APP_VERSION = "2.0.0"               # 与 GitHub Release 的 tag 对应
+APP_REPO = "GZLns/IsaacModManager"
+
 APP_TAG = "isaac-mod-manager"       # 单实例探测用的标识
 LIBRARY_DIR_NAME = "isaac_mod_library"
 LEGACY_DISABLED = "mods_disabled"          # 旧移动式方案留下的目录, 会被自动识别
@@ -240,6 +244,21 @@ ST_ENABLED, ST_DISABLED, ST_UNIMPORTED = "enabled", "disabled", "unimported"
 # ======================================================================
 #  基础工具
 # ======================================================================
+_CACHE = None
+
+
+def cache():
+    """本地缓存(SQLite) 单例 —— 工坊元数据 / 文件指纹 / 加载顺序 / 限流。
+
+    放在用户数据目录里, 与配置同级; 换新版本 exe 不会影响它。
+    """
+    global _CACHE
+    if _CACHE is None:
+        import modcache
+        _CACHE = modcache.get_cache(USER_DIR)
+    return _CACHE
+
+
 def load_config(path=CONFIG_PATH):
     cfg = {}
     if os.path.exists(path):
@@ -304,39 +323,123 @@ def dir_size(path):
     return total
 
 
-def fetch_workshop_info(ids, timeout=15):
+def fetch_workshop_info(ids, timeout=15, max_age=10800, use_cache=True):
     """调 Steam Web API 批量查工坊条目信息 (公开数据, 不需要登录)
 
-    返回 {id: {id,title,size,updated,result,url}}
+    返回 {id: {id,title,size,updated,result,url,cached}}
+
+    - **先查本地缓存**(默认 3 小时内视为新鲜), 只对缺失/过期的 id 发请求
+    - 发请求前过一遍**滑动窗口限流**(180 次 / 300 秒), 被限流就只用缓存
+    - `result=9`(条目不存在/已删除) 会记成永久失效, 以后不再重试
     """
     ids = [str(i) for i in (ids or []) if i]
     if not ids:
         return {}
-    data = {"itemcount": len(ids)}
-    for i, pid in enumerate(ids):
-        data["publishedfileids[%d]" % i] = pid
-    body = urllib.parse.urlencode(data).encode()
-    req = urllib.request.Request(STEAM_WS_API, data=body)
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    out = {}
+    todo = list(ids)
+    if use_cache:
+        try:
+            c = cache()
+            dead = c.dead_ids()
+            hit = c.get_workshop(ids, max_age=max_age)
+            for pid, it in hit.items():
+                out[pid] = {"id": pid, "title": it["title"], "size": it["size"],
+                            "updated": it["updated"], "result": 1,
+                            "url": STEAM_WS_PAGE + pid, "cached": True,
+                            "preview": it.get("preview", ""),
+                            "description": it.get("description", "")}
+            todo = [i for i in ids if i not in out and i not in dead]
+        except Exception:
+            todo = list(ids)
+
+    fresh = {}
+    if todo:
+        allowed = True
+        try:
+            allowed = cache().rate_allow()
+        except Exception:
+            allowed = True
+        if allowed:
+            BATCH = 50
+            for i in range(0, len(todo), BATCH):
+                chunk = todo[i:i + BATCH]
+                data = {"itemcount": len(chunk)}
+                for j, pid in enumerate(chunk):
+                    data["publishedfileids[%d]" % j] = pid
+                body = urllib.parse.urlencode(data).encode()
+                req = urllib.request.Request(STEAM_WS_API, data=body)
+                req.add_header("Content-Type", "application/x-www-form-urlencoded")
+                try:
+                    with urllib.request.urlopen(req, timeout=timeout) as r:
+                        raw = json.loads(r.read().decode("utf-8"))
+                except Exception as e:
+                    if not out:
+                        raise RuntimeError("查询 Steam 失败(检查网络): %s" % e)
+                    break
+                for d in raw.get("response", {}).get("publishedfiledetails", []):
+                    pid = str(d.get("publishedfileid") or "")
+                    if not pid:
+                        continue
+                    res = d.get("result")
+                    fresh[pid] = {
+                        "id": pid,
+                        "title": d.get("title") or "",
+                        "preview": d.get("preview_url") or "",
+                        "description": d.get("short_description") or "",
+                        "created": int(d.get("time_created") or 0),
+                        "size": int(d.get("file_size") or 0),
+                        "updated": int(d.get("time_updated") or 0),
+                        "result": res,
+                        "url": STEAM_WS_PAGE + pid,
+                        "cached": False,
+                    }
+            for pid, it in fresh.items():
+                out[pid] = it
+            if fresh or todo:
+                try:
+                    c = cache()
+                    good = {k: v for k, v in fresh.items() if v.get("result") == 1}
+                    if good:
+                        c.put_workshop(good)
+                    for pid in todo:
+                        it = fresh.get(pid)
+                        if it is not None and it.get("result") == 9:
+                            c.mark_dead(pid)
+                except Exception:
+                    pass
+    return out
+
+
+def _ver_tuple(v):
+    """"2.0.0" -> (2, 0, 0); 用来比较版本大小(字符串比较会出错)"""
+    return tuple(int(x) for x in re.findall(r"\d+", str(v))[:4]) or (0,)
+
+
+def check_self_update(timeout=12):
+    """查 GitHub 上有没有新版本(公开仓库, 不需要 token)"""
+    url = "https://api.github.com/repos/%s/releases/latest" % APP_REPO
+    req = urllib.request.Request(url)
+    req.add_header("User-Agent", "IsaacModManager/" + APP_VERSION)
+    req.add_header("Accept", "application/vnd.github+json")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            raw = json.loads(r.read().decode("utf-8"))
+            d = json.loads(r.read().decode("utf-8"))
     except Exception as e:
-        raise RuntimeError("查询 Steam 失败(检查网络): %s" % e)
-    out = {}
-    for d in raw.get("response", {}).get("publishedfiledetails", []):
-        pid = str(d.get("publishedfileid") or "")
-        if not pid:
-            continue
-        out[pid] = {
-            "id": pid,
-            "title": d.get("title") or "",
-            "size": int(d.get("file_size") or 0),
-            "updated": int(d.get("time_updated") or 0),
-            "result": d.get("result"),
-            "url": STEAM_WS_PAGE + pid,
-        }
-    return out
+        return {"ok": False, "current": APP_VERSION,
+                "error": "查询失败(检查网络): %s" % str(e)[:140]}
+    latest = str(d.get("tag_name") or "").lstrip("vV")
+    return {
+        "ok": True,
+        "current": APP_VERSION,
+        "latest": latest,
+        "newer": _ver_tuple(latest) > _ver_tuple(APP_VERSION),
+        "url": d.get("html_url") or "",
+        "published": (d.get("published_at") or "")[:10],
+        "notes": (d.get("body") or "")[:1500],
+        "assets": [{"name": a.get("name"), "size": a.get("size"),
+                    "url": a.get("browser_download_url")}
+                   for a in (d.get("assets") or [])],
+    }
 
 
 def read_metadata(mod_path):
@@ -422,9 +525,14 @@ class ModLibrary:
         self.config_path = config_path
         self.dry_run = False        # 测试用: 不真正打开资源管理器/启动游戏
         self.cfg = cfg if cfg is not None else load_config(config_path)
-        self.mods = {}          # dirname -> {name, version, id, state, dead_link?}
+        self.mods = {}          # dirname -> {name, version, id, state, dead_link?, link}
         self.dir_to_group = {}
         self.logs = []
+        self.conflict_map = {}       # dirname -> [被多个 mod 同时提供的相对路径]
+        self.conflict_detail = []    # 冲突清单(按涉及 mod 数倒序)
+        self.update_map = {}         # dirname -> 工坊有更新的信息
+        self._conflict_sig = None    # 上次冲突扫描时的状态签名(没变就复用结果)
+        self._conflict_ts = 0.0
         self.scan()
 
     # ---------- 路径 ----------
@@ -463,11 +571,16 @@ class ModLibrary:
                 if is_junction(p):
                     raw = junction_raw_target(p)
                     if raw and _norm(raw).startswith(lib_n + os.sep):
-                        if entry in self.mods:
-                            self.mods[entry]["state"] = ST_ENABLED
+                        # 链接名可能带排序前缀(如 "003_xxx"), 所以用"指向的仓库目录名"当键,
+                        # 这样自动排序改了链接名也不会让 mod 从列表里消失
+                        tgt = os.path.basename(os.path.normpath(raw))
+                        key = tgt if tgt in self.mods else entry
+                        if key in self.mods:
+                            self.mods[key]["state"] = ST_ENABLED
+                            self.mods[key]["link"] = entry
                         elif not os.path.isdir(p):
-                            self.mods[entry] = {"name": entry, "version": "", "id": "",
-                                                "state": ST_DISABLED, "dead_link": True}
+                            self.mods[key] = {"name": entry, "version": "", "id": "",
+                                              "state": ST_DISABLED, "dead_link": True}
                 elif entry not in self.mods:
                     info = read_metadata(p)
                     self.mods[entry] = {"name": info["name"], "version": info["version"],
@@ -489,6 +602,7 @@ class ModLibrary:
 
     # ---------- 状态输出 ----------
     def state(self):
+        self.ensure_conflicts()
         stats = {"total": len(self.mods), "enabled": 0, "disabled": 0, "unimported": 0,
                  "selected_ratio": 0}
         for m in self.mods.values():
@@ -503,7 +617,9 @@ class ModLibrary:
             mods.append({"dir": d, "name": m["name"], "version": m["version"],
                          "id": m.get("id", ""), "state": m["state"],
                          "dead_link": bool(m.get("dead_link")),
-                         "group": self.dir_to_group.get(d, "")})
+                         "group": self.dir_to_group.get(d, ""),
+                         "link": m.get("link") or d,
+                         "conflicts": len(self.conflict_map.get(d) or [])})
         groups = []
         for i, g in enumerate(self.cfg["groups"]):
             en = sum(1 for d in g["mods"] if self.mods.get(d, {}).get("state") == ST_ENABLED)
@@ -526,7 +642,15 @@ class ModLibrary:
                     "data_dir": os.path.dirname(os.path.abspath(self.config_path)),
                     "config_file": os.path.abspath(self.config_path),
                     "portable": (os.path.normcase(os.path.dirname(
-                        os.path.abspath(self.config_path))) == os.path.normcase(APP_DIR))},
+                        os.path.abspath(self.config_path))) == os.path.normcase(APP_DIR)),
+                    "backup_enabled": bool(self.cfg.get("backup_enabled", True)),
+                    "backup_keep": int(self.cfg.get("backup_keep") or 10),
+                    "sort_rules": len(self.cfg.get("sort_rules") or [])},
+            "version": APP_VERSION,
+            "conflicts": {"count": len(self.conflict_detail),
+                          "mods": len(self.conflict_map),
+                          "items": self.conflict_detail[:80]},
+            "updates": self.update_state(),
             "logs": self.logs[-6:],
         }
 
@@ -553,7 +677,7 @@ class ModLibrary:
         if rec is None:
             # 之前这里静默 return, 导致 API 返回 200 但什么都没做 (前端会谎报"启用 1 个")
             raise RuntimeError("列表中找不到该 mod: " + dirname)
-        link = os.path.join(self.mods_path, dirname)
+        link = os.path.join(self.mods_path, rec.get("link") or dirname)
         if enable:
             if rec["state"] == ST_ENABLED:
                 return
@@ -632,6 +756,383 @@ class ModLibrary:
             msg += "；失败: " + "; ".join(fail)
         self.log(msg)
         return msg
+
+    # ================================================================
+    #  ① 冲突检测: 多个 mod 会覆盖同一个资源文件
+    # ================================================================
+    # 只统计"子目录里的"资源文件 —— 根目录的 main.lua / metadata.xml 每个 mod 都有,
+    # 那不算冲突。子目录里的 resources/xxx.png 才会真的互相覆盖。
+    CONFLICT_EXTS = {".png", ".anm2", ".wav", ".lua"}
+    SCAN_IGNORE_DIRS = {"__pycache__", ".git", ".svn", "node_modules", "$RECYCLE.BIN"}
+
+    @classmethod
+    def _dir_token(cls, path):
+        """目录状态的轻量指纹: 顶层 mtime + 条目名与各自 mtime。
+
+        只要这个 token 没变, 就认为上次缓存的文件清单还能用 ——
+        避免每次启动都把每个 mod 的整棵目录树走一遍(大 mod 几百个文件)。
+        """
+        h = hashlib.blake2b(digest_size=16)
+        try:
+            h.update(("%.6f\0" % os.path.getmtime(path)).encode())
+            entries = sorted(os.listdir(path))
+        except OSError:
+            return None
+        for e in entries:
+            if e in cls.SCAN_IGNORE_DIRS:
+                continue
+            h.update(e.encode("utf-8", "replace") + b"\0")
+            try:
+                h.update(("%.6f\0" % os.path.getmtime(os.path.join(path, e))).encode())
+            except OSError:
+                h.update(b"0\0")
+        return h.hexdigest()
+
+    def _mod_conflict_files(self, dirname, force=False):
+        """取一个 mod 里"可能冲突"的资源文件相对路径列表(带指纹缓存)"""
+        base = os.path.join(self.library_path, dirname)
+        if not os.path.isdir(base):
+            return []
+        try:
+            c = cache()
+        except Exception:
+            c = None
+        token = self._dir_token(base)
+        if c is not None and token and not force:
+            row = c.get_fingerprint(dirname)
+            if row and row.get("token") == token:
+                return row["files"]
+        files = []
+        for root, dirs, names in os.walk(base):
+            dirs[:] = [d for d in dirs if d not in self.SCAN_IGNORE_DIRS]
+            for n in names:
+                if os.path.splitext(n)[1].lower() not in self.CONFLICT_EXTS:
+                    continue
+                rel = os.path.relpath(os.path.join(root, n), base)
+                if os.sep not in rel:
+                    continue                      # 根目录的文件不算
+                files.append(rel.lower().replace("/", os.sep))
+        if c is not None and token:
+            try:
+                c.set_fingerprint(dirname, token, files)
+            except Exception:
+                pass
+        return files
+
+    def conflict_scan(self, force=False):
+        """扫描所有**已启用** mod 之间会互相覆盖的文件, 返回冲突清单"""
+        idx = {}
+        for d, rec in self.mods.items():
+            if rec["state"] != ST_ENABLED:
+                continue
+            for rel in self._mod_conflict_files(d, force=force):
+                idx.setdefault(rel, []).append(d)
+        cmap, detail = {}, []
+        for rel, dirs in idx.items():
+            if len(dirs) < 2:
+                continue
+            ds = sorted(dirs)
+            for d in ds:
+                cmap.setdefault(d, []).append(rel)
+            detail.append({
+                "path": rel,
+                "mods": ds,
+                "names": [self.mods.get(d, {}).get("name") or d for d in ds],
+            })
+        detail.sort(key=lambda x: (-len(x["mods"]), x["path"]))
+        self.conflict_map = cmap
+        self.conflict_detail = detail
+        self.log("冲突检测: %d 处重叠, 涉及 %d 个 mod" % (len(detail), len(cmap)))
+        return detail
+
+    def ensure_conflicts(self, force=False, max_age=25):
+        """按需刷新冲突结果: mod 集合/状态没变且没超时就复用"""
+        sig = tuple(sorted((d, m["state"]) for d, m in self.mods.items()))
+        fresh = (time.time() - self._conflict_ts) < max_age
+        if not force and self._conflict_sig == sig and fresh:
+            return self.conflict_detail
+        self._conflict_sig = sig
+        self._conflict_ts = time.time()
+        return self.conflict_scan(force=force)
+
+    # ================================================================
+    #  ③ mod 更新提醒: 比较工坊的 time_updated
+    # ================================================================
+    def check_updates(self, mark_seen=False, max_age=600):
+        """检查已安装 mod 在工坊上有没有新版本。
+
+        做法: 记住"上次见到的 time_updated"。第一次见到记下来(视为已知),
+        之后工坊时间变大就算有更新 —— 这样不会把刚装的 mod 全报成"有更新"。
+        """
+        pairs = [(d, str(rec.get("id") or "")) for d, rec in self.mods.items()
+                 if rec.get("id")]
+        if not pairs:
+            return {"checked": 0, "updates": [], "rate": None}
+        ids = [p[1] for p in pairs]
+        try:
+            infos = fetch_workshop_info(ids, max_age=max_age)
+        except Exception as e:
+            return {"checked": 0, "updates": [], "error": str(e)[:140]}
+        try:
+            c = cache()
+        except Exception:
+            return {"checked": 0, "updates": [], "error": "缓存不可用"}
+        updates = []
+        for d, wid in pairs:
+            it = infos.get(wid) or {}
+            cur = int(it.get("updated") or 0)
+            if not cur:
+                continue
+            key = "seen_upd:" + wid
+            seen = c.kv_get(key)
+            if seen is None:
+                c.kv_set(key, cur)
+            elif cur > int(seen or 0):
+                updates.append({"dir": d, "name": self.mods[d].get("name") or d,
+                                "id": wid, "was": int(seen or 0), "now": cur,
+                                "url": STEAM_WS_PAGE + wid})
+        marked = 0
+        if mark_seen:
+            for u in updates:
+                c.kv_set("seen_upd:" + u["id"], u["now"])
+            marked = len(updates)
+            updates = []            # 用户已确认"我知道了", 本次就不再列出来
+        self.update_map = {u["dir"]: u for u in updates}
+        c.kv_set("last_update_check", time.strftime("%Y-%m-%d %H:%M:%S"))
+        return {"checked": len(ids), "updates": updates, "marked": marked,
+                "rate": c.rate_state()}
+
+    def update_state(self):
+        try:
+            last = cache().kv_get("last_update_check")
+        except Exception:
+            last = None
+        return {"count": len(self.update_map),
+                "items": sorted(self.update_map.values(), key=lambda x: x["name"]),
+                "last_check": last}
+
+    # ================================================================
+    #  ④ 自动排序: 规则(按工坊ID的 before/after) + 拓扑排序 + 落到链接名
+    # ================================================================
+    _SEQ_RE = re.compile(r"^\d{2,4}_")
+
+    def sort_rules(self):
+        return list(self.cfg.get("sort_rules") or [])
+
+    def set_sort_rules(self, rules):
+        out = []
+        for r in (rules or []):
+            if not isinstance(r, dict):
+                continue
+            rid = str(r.get("id") or "").strip()
+            if not rid:
+                continue
+            item = {"id": rid}
+            for k in ("after", "before"):
+                vals = [str(x).strip() for x in (r.get(k) or []) if str(x).strip()]
+                if vals:
+                    item[k] = vals
+            out.append(item)
+        self.cfg["sort_rules"] = out
+        self.save()
+        return out
+
+    def auto_sort(self):
+        """按规则算加载顺序(不改文件)。
+
+        节点 = 已启用的 mod; 边 = "A 必须在 B 之后"。用 Kahn 做拓扑排序,
+        环里的 mod 会原样附在末尾并单独报出来。
+        """
+        nodes = [d for d, r in self.mods.items() if r["state"] == ST_ENABLED]
+        if not nodes:
+            return {"order": [], "cycles": [], "applied": False}
+        by_id = {}
+        for d in nodes:
+            wid = str(self.mods[d].get("id") or "")
+            if wid:
+                by_id[wid] = d
+        edges = {d: set() for d in nodes}          # d 必须排在 edges[d] 里的元素之后
+        for r in self.sort_rules():
+            me = by_id.get(str(r.get("id")))
+            if not me:
+                continue
+            for other in (r.get("after") or []):
+                o = by_id.get(str(other))
+                if o and o != me:
+                    edges[me].add(o)
+            for other in (r.get("before") or []):
+                o = by_id.get(str(other))
+                if o and o != me:
+                    edges.setdefault(o, set()).add(me)
+        # Kahn: 反复取"没有前置要求"的节点(按目录名稳定排序, 结果可复现)
+        order, done = [], set()
+        remain = set(nodes)
+        progress = True
+        while remain and progress:
+            progress = False
+            for d in sorted(remain):
+                if edges.get(d, set()) - done:
+                    continue
+                order.append(d)
+                done.add(d)
+                remain.discard(d)
+                progress = True
+        cycles = sorted(remain)                     # 互相依赖(成环)的
+        order += cycles
+        return {"order": order, "cycles": cycles, "applied": False,
+                "rules": len(self.sort_rules())}
+
+    def apply_load_order(self, order=None):
+        """把算出来的顺序**落到 mods/ 里的链接名**上(加 "NNN_" 前缀)。
+
+        只改链接(指向仓库实体的那个软链接), 仓库里的实体目录名不动 ——
+        游戏按 mods/ 下的目录名排序, 所以改链接名就等于改加载顺序。
+        """
+        if order is None:
+            order = self.auto_sort()["order"]
+        if self.dry_run:
+            return {"changed": 0, "dry_run": True, "order": order}
+        plan, seen = [], set()
+        for i, d in enumerate(order, 1):
+            rec = self.mods.get(d)
+            if not rec or rec["state"] != ST_ENABLED:
+                continue
+            cur = rec.get("link") or d
+            if os.path.basename(cur) in seen:
+                continue
+            seen.add(os.path.basename(cur))
+            base = self._SEQ_RE.sub("", cur)
+            plan.append((cur, "%03d_%s" % (i, base)))
+        # 先把所有要动的链接改成临时名, 再改成目标名 —— 否则 A→B 而 B 还在会撞名
+        tmp = []
+        for idx, (cur, _tgt) in enumerate(plan):
+            src = os.path.join(self.mods_path, cur)
+            if not is_junction(src):
+                continue
+            t = ".imsort%03d" % idx
+            try:
+                os.rename(src, os.path.join(self.mods_path, t))
+                tmp.append((t, _tgt))
+            except OSError:
+                pass
+        changed = 0
+        for t, tgt in tmp:
+            try:
+                os.rename(os.path.join(self.mods_path, t),
+                          os.path.join(self.mods_path, tgt))
+                changed += 1
+            except OSError:
+                try:
+                    os.rename(os.path.join(self.mods_path, t),
+                              os.path.join(self.mods_path, self._SEQ_RE.sub("", tgt)))
+                except OSError:
+                    pass
+        try:
+            cache().save_order(order)
+        except Exception:
+            pass
+        self.log("已应用加载顺序: %d 个链接重命名" % changed)
+        self.scan()
+        return {"changed": changed, "order": order}
+
+    def clear_load_order(self):
+        """去掉所有链接上的顺序前缀(回到自然顺序)"""
+        if self.dry_run:
+            return {"changed": 0, "dry_run": True}
+        changed = 0
+        for d, rec in list(self.mods.items()):
+            cur = rec.get("link") or d
+            base = self._SEQ_RE.sub("", cur)
+            if base == cur:
+                continue
+            src = os.path.join(self.mods_path, cur)
+            if not is_junction(src):
+                continue
+            try:
+                os.rename(src, os.path.join(self.mods_path, base))
+                changed += 1
+            except OSError:
+                pass
+        try:
+            cache().save_order([])
+        except Exception:
+            pass
+        self.scan()
+        self.log("已清除加载顺序前缀: %d 个" % changed)
+        return {"changed": changed}
+
+    # ================================================================
+    #  ⑥ 备份(轻量快照: 配置 + mod 清单, 不是整个仓库)
+    # ================================================================
+    def backup_dir(self):
+        return os.path.join(os.path.dirname(os.path.abspath(self.config_path)), "backups")
+
+    def backup_now(self, reason="manual"):
+        d = self.backup_dir()
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError as e:
+            raise RuntimeError("备份目录不可写: %s" % e)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        tag = re.sub(r"[^\w\-]+", "_", reason or "manual")[:20]
+        path = os.path.join(d, "backup-%s-%s.zip" % (stamp, tag))
+        manifest = {
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "reason": reason, "app_version": APP_VERSION,
+            "mods_path": self.mods_path, "library_path": self.library_path,
+            "groups": self.cfg.get("groups") or [],
+            "sort_rules": self.cfg.get("sort_rules") or [],
+            "mods": [{"dir": k, "name": v.get("name", ""), "id": v.get("id", ""),
+                      "state": v.get("state", ""), "link": v.get("link") or k}
+                     for k, v in sorted(self.mods.items())],
+        }
+        note = ("Isaac Mod Manager 备份\r\n"
+                "时间: %s\r\n原因: %s\r\n\r\n"
+                "config.json  —— 当时的完整配置(含分组与排序规则)\r\n"
+                "mods.json    —— 当时的 mod 清单(名字/工坊ID/启用状态/链接名)\r\n\r\n"
+                "这是「状态快照」, 不含 mod 文件本体。要还原 mod 文件请用仓库目录。\r\n"
+                % (manifest["created"], reason))
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("config.json", json.dumps(self.cfg, ensure_ascii=False, indent=2))
+            z.writestr("mods.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+            z.writestr("README.txt", note)
+        keep = max(1, int(self.cfg.get("backup_keep") or 10))
+        try:
+            files = sorted(glob.glob(os.path.join(d, "backup-*.zip")))
+            for old in files[:-keep]:
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+        except Exception:
+            pass
+        self.log("已备份: " + os.path.basename(path))
+        return {"name": os.path.basename(path), "path": path,
+                "size": os.path.getsize(path)}
+
+    def list_backups(self):
+        d = self.backup_dir()
+        out = []
+        if os.path.isdir(d):
+            for f in sorted(glob.glob(os.path.join(d, "backup-*.zip")), reverse=True):
+                try:
+                    out.append({"name": os.path.basename(f), "size": os.path.getsize(f),
+                                "time": time.strftime("%Y-%m-%d %H:%M:%S",
+                                                      time.localtime(os.path.getmtime(f)))})
+                except OSError:
+                    pass
+        return {"dir": d, "enabled": bool(self.cfg.get("backup_enabled", True)),
+                "keep": int(self.cfg.get("backup_keep") or 10), "items": out}
+
+    def _auto_backup(self, reason):
+        """批量操作前自动备份(开关关掉就跳过)"""
+        if not self.cfg.get("backup_enabled", True):
+            return None
+        try:
+            return self.backup_now(reason)
+        except Exception as e:
+            self.log("自动备份失败(继续操作): %s" % str(e)[:100])
+            return None
 
     def sync_to_game(self):
         created, removed, fixed, fail = 0, 0, 0, []
@@ -1236,6 +1737,13 @@ class ModLibrary:
         raise RuntimeError(res.get("error") or "登录失败")
 
     def apply_settings(self, data):
+        if "backup_enabled" in data:
+            self.cfg["backup_enabled"] = bool(data.get("backup_enabled"))
+        if "backup_keep" in data:
+            try:
+                self.cfg["backup_keep"] = max(1, min(99, int(data.get("backup_keep") or 10)))
+            except (TypeError, ValueError):
+                pass
         if data.get("mods_path"):
             self.cfg["mods_path"] = os.path.normpath(data["mods_path"].strip())
         if "library_path" in data:
@@ -1418,10 +1926,13 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/mods/toggle":
                 lib.set_dirs([d["dir"]], bool(d.get("enable")), raise_on_fail=True)
             elif path == "/api/mods/batch":
+                if d.get("dirs"):
+                    lib._auto_backup("before-batch")       # 批量操作前留个快照
                 lib.set_dirs(list(d.get("dirs") or []), bool(d.get("enable")))
             elif path == "/api/mods/import":
                 lib.import_all()
             elif path == "/api/mods/sync":
+                lib._auto_backup("before-sync")
                 lib.sync_to_game()
             elif path == "/api/mods/clean_dead":
                 lib.clean_dead_link(d["dir"])
@@ -1443,6 +1954,35 @@ class Handler(BaseHTTPRequestHandler):
                 lib.group_disable(d.get("name", ""))
             elif path == "/api/settings":
                 lib.apply_settings(d)
+            elif path == "/api/conflicts":
+                detail = lib.ensure_conflicts(force=bool(d.get("force")))
+                self._extra = {"conflicts": {"items": detail,
+                                             "mods": len(lib.conflict_map),
+                                             "count": len(detail)}}
+            elif path == "/api/updates/check":
+                self._extra = {"ws_updates": lib.check_updates(
+                    mark_seen=bool(d.get("mark_seen")))}
+            elif path == "/api/sort/preview":
+                self._extra = {"sort": lib.auto_sort()}
+            elif path == "/api/sort/apply":
+                order = lib.auto_sort()["order"]
+                lib._auto_backup("before-sort")
+                res = lib.apply_load_order(order)
+                res["order"] = order
+                self._extra = {"sort": res}
+            elif path == "/api/sort/clear":
+                self._extra = {"sort": lib.clear_load_order()}
+            elif path == "/api/sort/rules":
+                if d.get("rules") is not None:
+                    self._extra = {"rules": lib.set_sort_rules(d.get("rules"))}
+                else:
+                    self._extra = {"rules": lib.sort_rules()}
+            elif path == "/api/app/update":
+                self._extra = {"app_update": check_self_update()}
+            elif path == "/api/backup/create":
+                self._extra = {"backup": lib.backup_now(d.get("reason") or "manual")}
+            elif path == "/api/backup/list":
+                self._extra = {"backups": lib.list_backups()}
             elif path == "/api/open_dir":
                 lib.open_dir(d.get("which", "library"), d.get("path"))
             elif path == "/api/launch":
