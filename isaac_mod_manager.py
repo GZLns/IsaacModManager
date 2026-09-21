@@ -172,7 +172,7 @@ def resolve_config_path(explicit=None, portable=False):
     return CONFIG_PATH
 
 
-APP_VERSION = "2.0.0"               # 与 GitHub Release 的 tag 对应
+APP_VERSION = "2.0.1"               # 与 GitHub Release 的 tag 对应
 APP_REPO = "GZLns/IsaacModManager"
 
 APP_TAG = "isaac-mod-manager"       # 单实例探测用的标识
@@ -442,6 +442,95 @@ def check_self_update(timeout=12):
     }
 
 
+STRIP_ID_FILE = ".imm_workshop_id"      # 原工坊 ID 存在这(我们自己读, 游戏不认)
+_ID_RE = re.compile(r"<id>\s*([^<]*?)\s*</id>")
+
+
+def saved_workshop_id(mod_path):
+    """读我们记下来的原工坊 ID"""
+    f = os.path.join(mod_path, STRIP_ID_FILE)
+    if os.path.isfile(f):
+        try:
+            with io.open(f, encoding="utf-8") as fp:
+                return fp.read().strip()
+        except OSError:
+            pass
+    return ""
+
+
+def strip_workshop_id(mod_path, mode="zero"):
+    """把 mod 的工坊 ID 摘掉, 让它对游戏/Steam 变成"本地 mod"。
+
+    背景: mods/ 是 Steam 工坊 mod 的托管区, 游戏启动时按订阅状态同步 ——
+    取消订阅后即使在本管理器里启用, 对应的目录也会被清掉(实测)。
+    摘掉 id 之后游戏不认它是工坊 mod, 就不会动它。
+
+    原 id 记进 `.imm_workshop_id`(管理器自己用), metadata.xml 里按 mode 处理:
+      mode="zero"   → 写成 <id>0</id>   (保留结构, 最不容易破坏解析)
+      mode="remove" → 整行删掉
+
+    返回被摘下来的原 id; 无需处理时返回 None。
+    """
+    meta = os.path.join(mod_path, "metadata.xml")
+    if not os.path.isfile(meta):
+        return None
+    try:
+        with io.open(meta, encoding="utf-8", errors="replace") as fp:
+            txt = fp.read()
+    except OSError:
+        return None
+    m = _ID_RE.search(txt)
+    if not m:
+        return None
+    cur = m.group(1).strip()
+    if not cur or cur == "0":
+        return None                      # 已经处理过
+    try:
+        with io.open(os.path.join(mod_path, STRIP_ID_FILE), "w", encoding="utf-8") as fp:
+            fp.write(cur)
+    except OSError:
+        return None
+    if mode == "remove":
+        txt = re.sub(r"\s*<id>\s*[^<]*?\s*</id>", "", txt, count=1)
+    else:
+        txt = _ID_RE.sub("<id>0</id>", txt, count=1)
+    try:
+        with io.open(meta, "w", encoding="utf-8") as fp:
+            fp.write(txt)
+    except OSError:
+        return None
+    return cur
+
+
+def restore_workshop_id(mod_path, mode="zero"):
+    """还原工坊 ID(想恢复成"官方订阅态"时用)"""
+    orig = saved_workshop_id(mod_path)
+    if not orig:
+        return None
+    meta = os.path.join(mod_path, "metadata.xml")
+    if not os.path.isfile(meta):
+        return None
+    try:
+        with io.open(meta, encoding="utf-8", errors="replace") as fp:
+            txt = fp.read()
+    except OSError:
+        return None
+    if _ID_RE.search(txt):
+        txt = _ID_RE.sub("<id>%s</id>" % orig, txt, count=1)
+    else:                                # 之前是删行, 得补回去(放在 <directory> 后面)
+        m = re.search(r"(<directory>[^<]*</directory>)", txt)
+        if m:
+            txt = txt[:m.end()] + "\n    <id>%s</id>" % orig + txt[m.end():]
+        else:
+            return None
+    try:
+        with io.open(meta, "w", encoding="utf-8") as fp:
+            fp.write(txt)
+    except OSError:
+        return None
+    return orig
+
+
 def read_metadata(mod_path):
     info = {"name": "", "version": "", "id": "", "description": ""}
     meta = os.path.join(mod_path, "metadata.xml")
@@ -456,6 +545,10 @@ def read_metadata(mod_path):
             pass
     if not info["name"]:
         info["name"] = os.path.basename(mod_path)
+    if not info["id"] or info["id"] == "0":
+        # "去工坊化"过的 mod: metadata 里的 id 被写成 0(或删掉), 真实的 id 在
+        # .imm_workshop_id 里 —— 管理器这边要照旧认得它是哪个工坊 mod
+        info["id"] = saved_workshop_id(mod_path)
     return info
 
 
@@ -645,7 +738,13 @@ class ModLibrary:
                         os.path.abspath(self.config_path))) == os.path.normcase(APP_DIR)),
                     "backup_enabled": bool(self.cfg.get("backup_enabled", True)),
                     "backup_keep": int(self.cfg.get("backup_keep") or 10),
-                    "sort_rules": len(self.cfg.get("sort_rules") or [])},
+                    "sort_rules": len(self.cfg.get("sort_rules") or []),
+                    "strip_workshop_id": bool(self.cfg.get("strip_workshop_id", True)),
+                    "strip_id_mode": self.cfg.get("strip_id_mode") or "zero",
+                    "stripped_count": sum(
+                        1 for d in self.mods
+                        if os.path.isdir(os.path.join(self.library_path, d))
+                        and saved_workshop_id(os.path.join(self.library_path, d)))},
             "version": APP_VERSION,
             "conflicts": {"count": len(self.conflict_detail),
                           "mods": len(self.conflict_map),
@@ -697,6 +796,12 @@ class ModLibrary:
             target = os.path.join(self.library_path, dirname)
             if not os.path.isdir(target):
                 raise RuntimeError("仓库里找不到该 mod 的实体文件夹: " + target)
+            # 启用前先把工坊 ID 摘掉 —— 否则一旦取消订阅, 游戏启动时会把
+            # mods/ 里的这个条目清掉(实测: 8 个 mod 全是这么没的)
+            if self.cfg.get("strip_workshop_id", True):
+                got = strip_workshop_id(target, self.cfg.get("strip_id_mode") or "zero")
+                if got:
+                    self.log("已去掉工坊 ID(%s), 让游戏不再把它当订阅内容: %s" % (got, dirname))
             create_junction(link, target)
         else:
             if rec["state"] == ST_UNIMPORTED:
@@ -726,6 +831,53 @@ class ModLibrary:
             msg += "；失败: " + "; ".join(fail)
         self.log(msg)
         return msg, fail
+
+    def strip_all_ids(self, mode=None):
+        """把仓库里所有 mod 都"去工坊化"(一次性), 并恢复被摘掉的 id 记录"""
+        mode = mode or self.cfg.get("strip_id_mode") or "zero"
+        done, skipped = [], []
+        for d in sorted(self.mods):
+            p = os.path.join(self.library_path, d)
+            if not os.path.isdir(p):
+                continue
+            got = strip_workshop_id(p, mode)
+            if got:
+                done.append({"dir": d, "id": got})
+            else:
+                skipped.append(d)
+        self.scan()
+        self.log("已去工坊化 %d 个 mod" % len(done))
+        return {"changed": len(done), "done": done, "skipped": skipped, "mode": mode}
+
+    def restore_all_ids(self):
+        """还原所有 mod 的工坊 ID"""
+        done = []
+        for d in sorted(self.mods):
+            p = os.path.join(self.library_path, d)
+            if not os.path.isdir(p):
+                continue
+            got = restore_workshop_id(p)
+            if got:
+                done.append({"dir": d, "id": got})
+        self.scan()
+        self.log("已还原 %d 个 mod 的工坊 ID" % len(done))
+        return {"changed": len(done), "done": done}
+
+    def strip_state(self):
+        """看看当前有多少 mod 是"已去工坊化"的"""
+        stripped, normal = [], []
+        for d in sorted(self.mods):
+            p = os.path.join(self.library_path, d)
+            if not os.path.isdir(p):
+                continue
+            if saved_workshop_id(p):
+                stripped.append({"dir": d, "name": self.mods[d].get("name") or d,
+                                 "id": saved_workshop_id(p)})
+            else:
+                normal.append(d)
+        return {"enabled": bool(self.cfg.get("strip_workshop_id", True)),
+                "mode": self.cfg.get("strip_id_mode") or "zero",
+                "stripped": stripped, "normal_count": len(normal)}
 
     def clean_dead_link(self, dirname):
         p = os.path.join(self.mods_path, dirname)
@@ -1737,6 +1889,10 @@ class ModLibrary:
         raise RuntimeError(res.get("error") or "登录失败")
 
     def apply_settings(self, data):
+        if "strip_workshop_id" in data:
+            self.cfg["strip_workshop_id"] = bool(data.get("strip_workshop_id"))
+        if data.get("strip_id_mode") in ("zero", "remove"):
+            self.cfg["strip_id_mode"] = data.get("strip_id_mode")
         if "backup_enabled" in data:
             self.cfg["backup_enabled"] = bool(data.get("backup_enabled"))
         if "backup_keep" in data:
@@ -1954,6 +2110,12 @@ class Handler(BaseHTTPRequestHandler):
                 lib.group_disable(d.get("name", ""))
             elif path == "/api/settings":
                 lib.apply_settings(d)
+            elif path == "/api/mods/strip_ids":
+                self._extra = {"strip": lib.strip_all_ids(d.get("mode"))}
+            elif path == "/api/mods/restore_ids":
+                self._extra = {"strip": lib.restore_all_ids()}
+            elif path == "/api/mods/strip_state":
+                self._extra = {"strip": lib.strip_state()}
             elif path == "/api/conflicts":
                 detail = lib.ensure_conflicts(force=bool(d.get("force")))
                 self._extra = {"conflicts": {"items": detail,

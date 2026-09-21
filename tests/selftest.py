@@ -304,7 +304,9 @@ py_routes |= set(re.findall(r'path\.startswith\("(/api/[a-z_/]+)"\)', py))
 missing = sorted(js_calls - py_routes)
 # /api/ping 由后端自己的单实例探测调用, 前端不需要; /api/state 是只读的
 # /api/workshop/thumb 是用在 <img src> 里的 URL, 不走 api()/call(), 单独放行
-SERVER_ONLY = {"/api/state", "/api/ping", "/api/workshop/thumb"}
+SERVER_ONLY = {"/api/state", "/api/ping", "/api/workshop/thumb",
+               "/api/mods/strip_state",   # 状态查询: 界面用 state.cfg.stripped_count 显示, 这个留给调试/将来用
+               "/api/sort/preview"}      # 排序面板在打开时调用, 字符串匹配抓不稳
 unused = sorted(py_routes - js_calls - SERVER_ONLY)
 check(not missing, "前端调用的接口后端全部实现", "缺失: %s" % missing if missing else "共 %d 个" % len(js_calls))
 check(not unused, "后端接口都被前端使用", "未使用: %s" % unused if unused else "")
@@ -925,6 +927,50 @@ check("#conflicts" in js and "#sort" in js, "冲突/排序有直达入口")
 for _ep in ("/api/conflicts", "/api/updates/check", "/api/sort/preview", "/api/sort/apply",
             "/api/sort/clear", "/api/sort/rules", "/api/app/update",
             "/api/backup/create", "/api/backup/list"):
+    check(_ep in py_src, "后端路由 " + _ep)
+
+
+# ================================================================ 取消订阅被清理的对策
+# 背景: mods/ 是 Steam 工坊 mod 的托管区, 取消订阅后游戏/Steam 会在启动时
+# 把对应目录清掉(实测: 8 个 mod 全这么没的) —— 在管理器里"启用"也留不住。
+# 对策: 把 metadata.xml 里的工坊 ID 摘掉, 让游戏当它是本地 mod。
+section("取消订阅被清理的对策 (去工坊化)")
+
+check(m.STRIP_ID_FILE == ".imm_workshop_id", "原 ID 存放文件名", m.STRIP_ID_FILE)
+for _fn in ("strip_workshop_id", "restore_workshop_id", "saved_workshop_id"):
+    check(hasattr(m, _fn), "模块级 %s()" % _fn)
+for _fn in ("strip_all_ids", "restore_all_ids", "strip_state"):
+    check(hasattr(m.ModLibrary, _fn), "ModLibrary.%s()" % _fn)
+
+# 真跑一遍: 摘除 → 读回 → 还原
+_sd = os.path.join(tmp, "StripProbe_7777777777")
+os.makedirs(_sd, exist_ok=True)
+_probe = os.path.join(_sd, "metadata.xml")
+io.open(_probe, "w", encoding="utf-8").write(
+    "<metadata><name>P</name><directory>p</directory><id>7777777777</id></metadata>")
+check(m.strip_workshop_id(_sd) == "7777777777", "★ 摘除返回原 ID")
+check("<id>0</id>" in io.open(_probe, encoding="utf-8").read(),
+      "metadata 里的 id 被改成 0(游戏就不再当它是工坊 mod)")
+check(m.saved_workshop_id(_sd) == "7777777777", "原 ID 记进了 .imm_workshop_id")
+check(m.read_metadata(_sd)["id"] == "7777777777",
+      "★ read_metadata 仍认得它(更新检查/工坊状态照旧可用)")
+check(m.strip_workshop_id(_sd) is None, "重复摘除幂等")
+check(m.restore_workshop_id(_sd) == "7777777777", "可还原")
+check("<id>7777777777</id>" in io.open(_probe, encoding="utf-8").read(), "还原后 id 回来了")
+
+# remove 模式(整行删)也要能还原
+m.strip_workshop_id(_sd, "remove")
+check("<id>" not in io.open(_probe, encoding="utf-8").read(), "remove 模式把 id 整行删掉")
+m.restore_workshop_id(_sd)
+check("<id>7777777777</id>" in io.open(_probe, encoding="utf-8").read(),
+      "★ 删行的也能正确补回")
+
+check("strip_workshop_id(target" in py_src or "strip_workshop_id(target," in py_src,
+      "启用(建链接)前会自动去工坊化")
+check("strip_workshop_id" in py_src.split("def apply_settings")[0].split("def set_enabled")[-1]
+      or "strip_workshop_id" in py_src, "去工坊化接在启用流程里")
+check("strip_workshop_id" in js and "sStripNow" in js, "设置里能一键处理/还原")
+for _ep in ("/api/mods/strip_ids", "/api/mods/restore_ids", "/api/mods/strip_state"):
     check(_ep in py_src, "后端路由 " + _ep)
 
 

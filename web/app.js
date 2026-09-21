@@ -1284,6 +1284,16 @@ function openSettings() {
     <div style="margin:-6px 0 12px;font-size:12px;color:#8b94a8;line-height:1.7">
       配置、分组、Steam 登录凭据都保存在这里（${c.portable ? '当前是<b>便携模式</b>，数据就在程序旁边' : '默认位置 <code>%LOCALAPPDATA%\\IsaacModManager</code>'}）。
       <b>换新版本的 exe 不会影响这些数据</b>；想备份就整个文件夹复制走。</div>
+    <div class="row"><label>启用时去掉工坊 ID</label>
+      <label class="check"><input type="checkbox" id="sStrip" ${c.strip_workshop_id !== false ? 'checked' : ''}><span>开启</span></label>
+      <button class="btn ghost" id="sStripNow">立即处理全部</button>
+      <button class="btn ghost" id="sStripRestore">还原 ID</button></div>
+    ${c.stripped_count ? `<div style="margin:-6px 0 4px;font-size:12px;color:#5fd97e">当前已有 ${c.stripped_count} 个 mod 处理过（原 ID 都记在各自目录的 .imm_workshop_id 里）。</div>` : ''}
+    <div style="margin:-6px 0 12px;font-size:12px;color:#8b94a8;line-height:1.7">
+      为什么要这样：<b>mods/ 是 Steam 工坊 mod 的托管区</b>，一旦你在 Steam 取消订阅，
+      游戏启动时会把对应条目直接清掉 —— 在本管理器里"启用"也留不住（实测 8 个 mod 全这么没的）。<br>
+      把 <code>metadata.xml</code> 里的工坊 ID 摘掉后，游戏就当它是<b>本地 mod</b>，不再清理；
+      原 ID 存在 mod 目录的 <code>.imm_workshop_id</code> 里，管理器照旧能查更新。</div>
     <div class="row"><label>操作前自动备份</label>
       <label class="check"><input type="checkbox" id="sBackup" ${c.backup_enabled !== false ? 'checked' : ''}><span>开启</span></label>
       <span class="val">保留 <input type="number" id="sKeep" min="1" max="99" value="${c.backup_keep || 10}" style="width:56px;padding:4px 6px;border-radius:7px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);color:#fff"> 份</span></div>
@@ -1309,6 +1319,18 @@ function openSettings() {
     box.querySelector('#sPickData').onclick = () => call('/api/open_dir', { path: box.querySelector('#sData').value });
     box.querySelector('#sCancel').onclick = closeModal;
     box.querySelector('#sQuit').onclick = () => { closeModal(); quitApp(); };
+    box.querySelector('#sStripNow').onclick = async () => {
+      closeModal();
+      const r = await call('/api/mods/strip_ids', {});
+      if (r && r.strip) toast('已处理 ' + r.strip.changed + ' 个 mod');
+      setTimeout(openSettings, 400);
+    };
+    box.querySelector('#sStripRestore').onclick = async () => {
+      closeModal();
+      const r = await call('/api/mods/restore_ids', {});
+      if (r && r.strip) toast('已还原 ' + r.strip.changed + ' 个 mod 的工坊 ID');
+      setTimeout(openSettings, 400);
+    };
     box.querySelector('#sBkNow').onclick = async () => {
       try {
         const r = await api('/api/backup/create', { reason: 'manual' });
@@ -1331,6 +1353,7 @@ function openSettings() {
         card_opacity: Number(card.value) / 100,
         bg_enabled: box.querySelector('#sBgOn').checked,
         backup_enabled: box.querySelector('#sBackup').checked,
+        strip_workshop_id: box.querySelector('#sStrip').checked,
         backup_keep: Number(box.querySelector('#sKeep').value) || 10,
       }, '设置已保存');
     };
